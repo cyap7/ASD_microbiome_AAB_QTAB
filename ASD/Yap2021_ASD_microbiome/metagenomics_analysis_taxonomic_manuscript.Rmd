@@ -1,0 +1,4058 @@
+---
+title: "Metagenomics Analysis"
+author: "by Chloe Yap - `r format(Sys.time(), '%d %B %Y')`"
+output:
+  epuRate::PCTG:
+    toc: TRUE
+    code_folding: "hide"
+---
+
+# Introduction to the dataset
+
+**The study**
+
+- Australian Autism Biobank (AAB)
+- and Queensland Twin and Adolescent Brain (QTAB) study to supplement UNR group
+
+**Study design**
+
+3 groups (total n=248, but 1 is missing dietary data --> n=247): 
+
+- ASD diagnosis
+- SIB: unaffected sibling of children with diagnosis
+- UNR: unaffected, unrelated children. 
+    - This group consists of 2 sub-groups: UNR_AAB + UNR_QTAB. More-detailed justification for including the UNR_QTAB is provided in Note S1
+
+**Input dataset**
+
+- Taxonomy data tables from Microba (using MCPv2, which includes n=1751 species)
+- Rarefaction to 7M reads (apparently due to operational/computational reasons), except for 19/298 (Note 298 vs 248 - due to additional samples provided to Microba, not included in analysis here), minimum number of reads = 4.8M
+
+**Pre-processing of data**
+
+- Performed centred-log-ratio (clr) transformation (offset = 1e-3)
+- Removed taxa with <10 non-zero values (referred below here as "remove 0s") for some analyses 
+    - Analyses with removal:
+        - Bray-Curtis index + PERMANOVA + PERMDISP2
+        - sPLS-DA (+ also apply offset = 1)
+        - Linear models: ANOVA/mixed linear model (to include family pair information)/partially-overlapping t-tests on clr-transformed data
+        - ANCOM
+    - Analysis without removal: 
+        - richness, Shannon index
+        - Fisher's test for presence/absence
+
+**Covariate choice**
+
+- chose age + sex + first 3 dietary PCs (from clr-transformed %energy data)
+- first 3 dietary PCs capture 41% of dietary variance (as measured by %energy intake), and may be interpreted as follows:
+    - PC1: diet low in non-meat core foods (vegetables, fruit, alternative proteins, grains, dairy) / high in non-meat non-core foods (sweet drinks, packed snacks, confectionery, baked products, takeaway, fatty meats) 
+    - PC2: high meat diet (+ high grains and vegetables) / low condiments, alternative proteins
+    - PC3: high grains, dairy and sweet drinks / low confectionery and baked products
+- chose %energy intake as the "source" data as it best accounts for total energy intake, which - in turn - is confounded by age. As a proportional dataset, it requires clr transformation
+
+**Overview of analysis below**
+
+- Diversity measures:
+    - alpha-diversity: richness, Shannon index: 
+        - no difference after regressing out covariates: age + sex + first 3 dietary PCs (from clr-transformed %energy data)
+    - beta-diversity: Bray-Curtis (dissimilarity) index (not able to do Unifrac as don't have sequence data for the phylogenetic tree)
+        - ASD-SIB pairs have significantly lower Bray-Curtis index than random samples (through permutation and rank-based tests)
+        - PERMANOVA to test for difference in mean between groups in beta-diversity
+        - PERMDISP2 to test for difference in variance between groups in beta-diversity
+- Looked at the relationship between dietary PCs and taxa (after regressing out age, sex)
+- Ordination: (using mixOmics)
+    - tested various combinations of analyses: 
+        - ASD/SIB/UNR/UNR_QTAB (as the UNR groups are slightly different in demographic)
+        - ASD/SIB/UNR, without covariates
+        - ASD/SIB/UNR, with covariates (age, sex, first 3 PCs from clr-transformed %energy data)
+- ANCOM (all ASD/nonASD analyses)
+    - settings: out_cut = 0.05, zero_cut = 0.90, lib_cut = 1e6, neg_lb = TRUE
+    - Romboutsia timonensis was a consistent signal
+    - tried other combinations of covariates to test robustness
+- Also did the above analyses on virus taxonomic data (generated count tables using MiCoP)
+    - no significant differences
+
+**Overall**
+
+- Negligible direct associations between ASD and the stool microbiome in this AAB+QTAB study
+- Instead, diet looks to be upstream of microbiome changes, and dietary preferences are associated with ASD features
+- Romboutsia timonensis seem to be the most reproducible differentially-abundant species (ANCOM, ALDEx2)
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+library(rmarkdown)    # install.packages("rmarkdown") 
+library(epuRate)      # devtools::install_github("holtzy/epuRate", force=TRUE)
+library(data.table)
+library(DT)
+library(tidyverse)
+library(plyr)
+library(reshape2)
+library(ggplot2)
+library(RColorBrewer)
+library(colorspace)
+library(ggstatsplot)
+library(cowplot)
+library(lme4)
+library(car)
+
+# Microbiome analysis packages
+# remotes::install_github("microbiome/microbiome")
+# BiocManager::install("microbiome")
+library(phyloseq)
+library(microbiome)
+library(vegan)
+
+# ANCOM
+#install.packages("exactRankTests")
+#install.packages("compositions")
+library(exactRankTests)
+library(compositions)
+library(nlme)
+library(dplyr)
+source("/PATH/TO/ANCOM-v2.1/scripts/ancom_v2.1.R")
+
+# mixMC
+# BiocManager::install('mixOmics')
+library(mixOmics)
+
+# Visualisation
+library(data.tree)
+library(treemap)
+library(networkD3)
+
+library(JOUSBoost) # for AdaBoost
+library(OneR) # for eval_model() function
+
+```
+
+<br><br><br><br>
+
+```{r, include = FALSE}
+
+#taxa_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_relativeabundance.tsv"
+taxa_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_relativeabundance_MGDBv2ext.tsv"
+#taxa_count_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_counts.tsv"
+taxa_count_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_counts_MGDBv2ext.tsv"
+func_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/functional_profiles/by_sample/MICROBA.samples.tsv"
+diet_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/Diet/AES_ACRC_QTAB/AES_ACRC_QTAB_diet_PC_Microba_248_pcenergy_PC13_clr.csv"
+pheno_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/Phenotype/extracted_pheno/cognitive_crossancestry_child.pheno"
+sample_qc_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/metrics.tsv"
+# sample_qc_dir <- "/Users/uqcyap3/Documents/Research/ASD/3_metagenomics/Microba_QC/Sample_QC.csv"
+
+```
+
+```{r, eval = FALSE}
+
+#taxa_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_relativeabundance.tsv"
+taxa_dir <- "/PATH/TO/taxonomic_profiles/profiles_relativeabundance_MGDBv2ext.tsv"
+#taxa_count_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_counts.tsv"
+taxa_count_dir <- "/PATH/TO/taxonomic_profiles/profiles_counts_MGDBv2ext.tsv"
+func_dir <- "/PATH/TO/functional_profiles/by_sample/MICROBA.samples.tsv"
+diet_dir <- "/PATH/TO/AES_ACRC_QTAB_diet_PC_Microba_248_pcenergy_PC13_clr.csv"
+pheno_dir <- "/PATH/TO/extracted_pheno/cognitive_crossancestry_child.pheno"
+sample_qc_dir <- "/PATH/TO/metrics.tsv"
+# sample_qc_dir <- "/Users/uqcyap3/Documents/Research/ASD/3_metagenomics/Microba_QC/Sample_QC.csv"
+
+```
+
+# Taxonomic analysis (bacteria - using Microba results)
+
+**Takeaways**
+
+- no significant taxa after multiple-testing
+- some taxa seem to come up a few times in various analyses
+		-	Romboutsia timonensis
+
+## Read in data
+```{r}
+
+taxa <- fread(taxa_dir, stringsAsFactors = FALSE)
+taxa_count <- fread(taxa_count_dir, stringsAsFactors = FALSE)
+pheno <- read.delim(pheno_dir, header = T, as.is = T)
+pheno <- pheno %>% filter(metagenomics_done == 1)
+diet <- read.csv(diet_dir, header = T, as.is = T)
+sample_qc <- read.delim(sample_qc_dir, header = T, as.is = T)
+
+```
+
+### Phenotype/Dietary data
+
+```{r}
+
+# Sort the pheno/covariates file
+diet <- diet[order(diet$MG_SampleID),]
+
+# Remove excluded individuals
+diet <- diet %>% filter(!IID %in% c(4494902)) # Smith Magenis syndrome
+diet <- diet %>% filter(participant_type %in% c("ASD", "SIB", "UNR")) %>% filter(participant_type_study %in% c("ASD", "SIB", "UNR", "UNR_QTAB")) # a double check, in case I eventually exclude others using a similar coding system
+
+# Clean BSC data
+diet$bristol_stool_chart_regroup <- NA
+diet$bristol_stool_chart_regroup[which(diet$bristol_stool_chart %in% 1:2)] <- 2
+diet$bristol_stool_chart_regroup[which(diet$bristol_stool_chart == 3)] <- 3
+diet$bristol_stool_chart_regroup[which(diet$bristol_stool_chart == 4)] <- 4
+diet$bristol_stool_chart_regroup[which(diet$bristol_stool_chart %in% 5:7)] <- 5
+diet$bristol_stool_chart_regroup <- as.factor(diet$bristol_stool_chart_regroup)
+
+# Make meds_antibiotic_current == 0 for QTAB (ie. just none reported for sensitivity analysis). Makes data munging easier (NAs are otherwise excluded)
+diet$meds_antibiotic_current[which(is.na(diet$meds_antibiotic_current))] <- 0
+
+# Get a diet file without missing data
+diet_full <- diet %>% filter(!is.na(PC1_diet_pe))
+
+```
+
+## Initial cleaning
+
+- remove species with lots of 0s (a requirement of ANCOM)
+
+### Formatting and remove samples not intended for this analysis (ie. QTAB twins)
+
+- remove samples not intended for this analysis
+- rename tables
+- divide read counts by 2 as they're measured individually as paired. Note that David from Microba said that the entire pair is kept or discarded, so dividing by 2 gives equivalent results vs MCPv1 (**only applies to newer taxonomic tables built on MCPv2**)
+
+```{r}
+
+# Update IDs
+count_cols <- grep("BBC", colnames(taxa))
+colnames(taxa)[count_cols] <- substring(colnames(taxa)[count_cols], 1, 7)
+colnames(taxa)[2] <- "GTDB.taxonomy"
+taxa <- data.frame(taxa)
+taxa_keep <- which(colnames(taxa) %in% diet$MG_SampleID)
+taxa <- data.frame(Taxon = gsub("s__", "", taxa$Taxon), GTDB.taxonomy = taxa$GTDB.taxonomy, sapply(taxa[,taxa_keep], function(x) x/2), stringsAsFactors = FALSE) # divide read counts by 2
+
+count_cols <- grep("BBC", colnames(taxa_count))
+colnames(taxa_count)[count_cols] <- substring(colnames(taxa_count)[count_cols], 1, 7)
+colnames(taxa_count)[2] <- "GTDB.taxonomy"
+taxa_count <- data.frame(taxa_count)
+taxa_count_keep <- which(colnames(taxa_count) %in% diet$MG_SampleID)
+taxa_count <- data.frame(Taxon = gsub("s__", "", taxa_count$Taxon), GTDB.taxonomy = taxa_count$GTDB.taxonomy, sapply(taxa_count[,taxa_count_keep], function(x) x/2), stringsAsFactors = FALSE) # divide read counts by 2
+
+```
+
+### Initial checks: dimensions and taxonomy
+
+- makes a semi-interactive plot!!
+
+```{r}
+
+print("Initial taxonomy data dimensions")
+dim(taxa)
+
+colnames(taxa)[which(colnames(taxa) == "GTDB taxonomy")] <- "GTDB.taxonomy"
+
+# Visualise taxonomy represented
+# https://cran.r-project.org/web/packages/data.tree/vignettes/data.tree.html
+taxa_name <- as.data.frame(do.call(rbind, strsplit(taxa$GTDB.taxonomy, "; ")))
+if (substring(taxa$Taxon, 1, 3) != "s__") {
+  taxa_name$species <- paste("s__", as.character(taxa$Taxon), sep = "")
+} else if (substring(taxa$Taxon, 1, 3) != "s__") {
+  taxa_name$species <- as.character(taxa$Taxon)
+}
+
+taxa_name <- apply(taxa_name, 2, function(x) substring(x, 4))
+colnames(taxa_name) <- c("domain", "phylum", "class", "order", "family", "genus", "species")
+taxa_name <- data.frame(taxa_name)
+
+taxa_name$pathString <- paste("GTDB Taxonomy", taxa_name$domain, taxa_name$phylum, taxa_name$class, taxa_name$order, taxa_name$family, taxa_name$genus, taxa_name$species, sep = "|")
+taxa_tree <- as.Node(taxa_name, pathDelimiter = "|")
+taxa_plot <- ToListExplicit(taxa_tree, unname = TRUE)
+radialNetwork(taxa_plot)
+
+# Check how many MIC species there are
+species <- length(unique(taxa_name$species)) 
+print(paste("Number of species:", species, sep = " "))
+mic_n <- length(grep("MIC", as.character(taxa_name$species)))
+print(paste("Number of MIC (Microba-specific) species:", mic_n, sep = " "))
+
+```
+
+### Add column of unassigned reads in count table
+
+```{r}
+
+count_cols <- grep("BBC", colnames(taxa_count))
+colnames(sample_qc)[which(colnames(sample_qc) == "ID")] <- "SampleID"
+sample_qc$SampleID <- substring(sample_qc$SampleID, 1, 7)
+sample_qc <- sample_qc %>% filter(SampleID %in% colnames(taxa_count)[2:ncol(taxa_count)]) %>% arrange(SampleID)
+
+sum.tmp <- colSums(data.frame(taxa_count[,count_cols]))
+
+identical(as.character(names(sum.tmp)), colnames(taxa_count[,count_cols]))
+
+unassigned <- as.numeric(sample_qc$TOTAL_DOWNSAMPLED - sum.tmp)
+names(unassigned) <- colnames(taxa_count)[3:ncol(taxa_count)]
+# taxa_count <- rbind(taxa_count, c("UNASSIGNED", "UNASSIGNED", unassigned))
+taxa_count[nrow(taxa_count) + 1,] <- NA
+taxa_count[nrow(taxa_count), "Taxon"] <- "UNASSIGNED"
+taxa_count[nrow(taxa_count), "GTDB.taxonomy"] <- "UNASSIGNED"
+taxa_count[nrow(taxa_count), 3:ncol(taxa_count)] <- unassigned
+
+```
+### Check zero counts
+
+- remove taxa with <10 non-zero counts (ie. >298 zero counts)
+- Note: Lutz from Microba said the following:
+    - For univariate (e.g. species/gene/function based) analyses, we remove features depending on the number of samples: for very small datasets (< 20 samples) features present in less than 3 samples are removed; for small datasets (20 - 50 samples), less than 5 samples; otherwise less than 10 samples.
+    - For species/taxa univariate analyses, we additionally only include species/taxa which have at least 100 assigned reads in at least one sample.
+    - The filtering described above is applied post-transformation. First, raw counts are analysed to determine features that will be removed post transformation. Second, raw data is transformed. Third, transformed data is filtered by removing features identified in step 1).
+
+1. Filter 1: based on features across number of samples (<10 non-zero samples)
+2. Filter 2: based on reads across number of samples (<100 assigned reads in at least one sample)
+    - **Note: this step only applies to the taxonomic/species data - NOT the functional data**
+
+```{r}
+
+# Filter 1: based on features across number of samples (<10 non-zero samples)
+zero_count <- unlist(lapply(1:nrow(taxa_count), function(x) length(which(taxa_count[x,] == 0))))
+hist(zero_count)
+zero_rm <- which(zero_count > ((ncol(taxa_count) - 2) - 10))
+zero_rm_taxa <- taxa_count$Taxon[zero_rm]
+
+# Filter 2: based on reads across number of samples (<100 assigned reads in at least one sample)
+maxcount_reads <- as.numeric(sapply(taxa_count[,count_cols], max))
+zero_reads_rm <- which(maxcount_reads < 100)
+
+taxa_rm0 <- taxa[-zero_rm,]
+taxa_count_rm0 <- taxa_count[-zero_rm,]
+
+print("New taxonomy data dimensions")
+nrow(taxa_count) - length(zero_rm)
+
+```
+
+### Visualise taxonomy with reduced features
+
+```{r}
+
+taxa_count_rm0.tmp <- taxa_count[-zero_rm,]
+
+# Visualise taxonomy represented
+# https://cran.r-project.org/web/packages/data.tree/vignettes/data.tree.html
+taxa_name_rm0 <- as.data.frame(do.call(rbind, strsplit(taxa_count_rm0.tmp$GTDB.taxonomy, "; ")))
+taxa_name_rm0$species <- as.character(taxa_count_rm0.tmp$Taxon)
+taxa_name_rm0 <- apply(taxa_name_rm0, 2, function(x) substring(x, 4))
+colnames(taxa_name_rm0) <- c("domain", "phylum", "class", "order", "family", "genus", "species")
+taxa_name_rm0 <- data.frame(taxa_name_rm0)
+
+taxa_name_rm0$pathString <- paste("GTDB Taxonomy", taxa_name_rm0$domain, taxa_name_rm0$phylum, taxa_name_rm0$class, taxa_name_rm0$order, taxa_name_rm0$family, taxa_name_rm0$genus, taxa_name_rm0$species, sep = "|")
+taxa_tree <- as.Node(taxa_name_rm0, pathDelimiter = "|")
+taxa_plot <- ToListExplicit(taxa_tree, unname = TRUE)
+radialNetwork(taxa_plot)
+
+# Check how many MIC species there are
+species <- length(unique(taxa_name_rm0$species)) 
+print(paste("Number of species:", species, sep = " "))
+mic_n <- length(grep("MIC", as.character(taxa_name_rm0$species)))
+print(paste("Number of MIC (Microba-specific) species:", mic_n, sep = " "))
+
+```
+
+### Perform centred log-ratio transformation (clr) - ANOVA
+
+- Need to perform clr before removal of low-abundance taxa
+
+#### Relative abundance
+
+```{r}
+
+# Perform clr
+taxa_clr <- taxa
+#taxa_clr.tmp <- data.frame(clr(as.matrix(taxa_clr[,3:ncol(taxa_clr)])))
+taxa_clr.tmp <- data.frame(logratio.transfo(as.matrix(taxa_clr[,3:ncol(taxa_clr)], logratio = "CLR", offset = 0.001)))
+taxa_clr <- data.frame(Taxon = taxa$Taxon, GTDB.taxonomy = taxa$GTDB.taxonomy, taxa_clr.tmp)
+
+# Remove low-abundance taxa
+taxa_rm0_clr <- taxa_clr[-which(taxa_clr$Taxon %in% zero_rm_taxa),]
+if (length(zero_reads_rm) >= 1) {
+  taxa_rm0_clr <- taxa_rm0_clr[-which(taxa_rm0_clr$Taxon %in% zero_reads_rm),]
+}
+
+```
+
+#### Read counts
+
+```{r}
+
+# Perform clr
+taxa_count_clr <- taxa_count
+#taxa_count_clr.tmp <- data.frame(clr(as.matrix(taxa_count_clr[,3:ncol(taxa_count_clr)])))
+tmp <- as.matrix(taxa_count_clr[,3:ncol(taxa_count_clr)])
+taxa_count_clr.tmp <- logratio.transfo(tmp, logratio = "CLR", offset = 0.001)
+class(taxa_count_clr.tmp) <- "matrix"
+taxa_count_clr <- data.frame(Taxon = taxa_count$Taxon, GTDB.taxonomy = taxa_count$GTDB.taxonomy, taxa_count_clr.tmp)
+
+# Remove low-abundance taxa
+taxa_count_rm0_clr <- taxa_count_clr[-which(taxa_count_clr$Taxon %in% zero_rm_taxa),]
+taxa_count_rm0_clr$Taxon <- as.character(taxa_count_rm0_clr$Taxon)
+if (length(zero_reads_rm) >= 1) {
+  taxa_count_rm0_clr <- taxa_count_rm0_clr[-which(taxa_count_rm0_clr$Taxon %in% zero_reads_rm),]
+}
+
+```
+
+### Prepare the data for other formats
+
+#### Transpose relative abundance matrices
+
+```{r}
+
+# Transpose all but the name columns in the matrices
+# https://stackoverflow.com/questions/6778908/transpose-a-data-frame
+
+# Read counts, keep 0s non-clr dataframe
+# n <- substring(as.character(taxa_count$Taxon), 4)
+n <- as.character(taxa_count$Taxon)
+taxa_count_t <- as.data.frame(t(taxa_count[,-(1:2)]))
+colnames(taxa_count_t) <- n
+taxa_count_t <- data.frame(MG_SampleID = rownames(taxa_count_t), taxa_count_t)
+taxa_count_t <- taxa_count_t[order(taxa_count_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+# Read counts, keep 0s clr dataframe
+# n <- substring(as.character(taxa_count$Taxon), 4)
+n <- as.character(taxa_count$Taxon)
+taxa_count_clr_t <- as.data.frame(t(taxa_count_clr[,-(1:2)]))
+colnames(taxa_count_clr_t) <- n
+taxa_count_clr_t <- data.frame(MG_SampleID = rownames(taxa_count_clr_t), taxa_count_clr_t)
+taxa_count_clr_t <- taxa_count_clr_t[order(taxa_count_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+# Read counts, remove 0s non-clr dataframe
+# n <- substring(as.character(taxa_count_rm0$Taxon), 4)
+n <- as.character(taxa_count_rm0$Taxon)
+taxa_count_rm0_t <- as.data.frame(t(taxa_count_rm0[,-(1:2)]))
+colnames(taxa_count_rm0_t) <- n
+taxa_count_rm0_t <- data.frame(MG_SampleID = rownames(taxa_count_rm0_t), taxa_count_rm0_t)
+taxa_count_rm0_t <- taxa_count_rm0_t[order(taxa_count_rm0_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+# Read counts, remove 0s clr dataframe
+# n <- substring(as.character(taxa_count_rm0$Taxon), 4)
+n <- as.character(taxa_count_rm0$Taxon)
+taxa_count_rm0_clr_t <- as.data.frame(t(taxa_count_rm0_clr[,-(1:2)]))
+colnames(taxa_count_rm0_clr_t) <- n
+taxa_count_rm0_clr_t <- data.frame(MG_SampleID = rownames(taxa_count_rm0_clr_t), taxa_count_rm0_clr_t)
+taxa_count_rm0_clr_t <- taxa_count_rm0_clr_t[order(taxa_count_rm0_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+# Relative abundances, keep 0s non-clr dataframe
+# n <- substring(as.character(taxa$Taxon), 4)
+n <- as.character(taxa$Taxon)
+taxa_t <- as.data.frame(t(taxa[,-(1:2)]))
+colnames(taxa_t) <- n
+taxa_t <- data.frame(MG_SampleID = rownames(taxa_t), taxa_t)
+taxa_t <- taxa_t[order(taxa_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+### Identify individuals with <7M reads
+
+```{r}
+
+# Find the corresponding IDs
+rm_rarefy <- sample_qc %>% filter(TOTAL_DOWNSAMPLED < 7e6) %>% pull(SampleID)
+
+# Find the distribution across groups
+diet %>% filter(MG_SampleID %in% rm_rarefy) %>% pull(participant_type) %>% table()
+diet %>% filter(MG_SampleID %in% rm_rarefy) %>% pull(participant_type_study) %>% table()
+
+```
+
+## Diversity metrics
+
+- Takeaway: richness and diversity differences seen in the Microba analysis appear to be due to covariates
+- N.B. didn't rarefy per se, but back-derived the number of reads (already rarefied to ~7M)
+
+### Richness
+
+- Richness: number of species above a certain detection level (here = 0)
+- To calculate richness, Microba rarefied to 3M reads. Difficult here when dealing with a count table ...
+
+#### No covariates
+
+- This (significant) result was seen in the Microba analysis comparing all groups
+
+```{r}
+
+richness.df <- data.frame(MG_SampleID = colnames(taxa_count)[3:ncol(taxa_count)], richness0 = richness(taxa_count[,3:ncol(taxa_count)], detection = 0)[,1])
+richness.df <- plyr::join(richness.df, diet, by = "MG_SampleID", type = "inner")
+
+# summary(aov(richness0 ~ participant_type_study, data = richness.df))
+oneway.test(richness0 ~ participant_type_study, data = richness.df)
+
+ggplot(richness.df, aes(x = participant_type_study, y = richness0, colour = participant_type_study)) + geom_boxplot()
+
+richness.df <- data.frame(MG_SampleID = colnames(taxa_count)[3:ncol(taxa_count)], richness0 = richness(taxa_count[,3:ncol(taxa_count)], detection = 0)[,1])
+richness.df <- plyr::join(richness.df, diet, by = "MG_SampleID", type = "inner")
+
+# summary(aov(richness0 ~ participant_type_study, data = richness.df))
+oneway.test(richness0 ~ participant_type, data = richness.df)
+
+ggplot(richness.df, aes(x = participant_type, y = richness0, colour = participant_type)) + geom_boxplot()
+
+```
+
+#### Covariates
+
+**Approximate results when regressing alpha diversity measures against covariates**
+
+- age + sex: 12.6% of variance
+- age + sex + month: 16.1% of variance
+- age + sex + seasonality (fit a cosine curve): 12.6% of variance
+- top 3 PCs (no clr-transform): 6.8% of variance, PC2 sig (makes sense as previously found that age was assoc with PC2 in particular)
+- top 3 PCs (clr-transform): 10.6% of variance, PC2 and PC3 sig
+- age + sex + month + top 3 PCs (no clr-transform): 17.5% of variance, no PC sig
+- age + sex + month + top 3 PCs (clr-transform): 19.1% of variance, PC3 sig
+- age + sex + top 3 PCs (no clr-transform): 15.1% of variance, PC 2 and PC3 sig
+- age + sex + top 3 PCs (clr-transform): 16.1% of variance, PC3 sig
+- % energy questions (no clr-transform): 5.1% of variance, no sig
+- % energy questions (clr-transform): 8.4% of variance, pemeat, peconfect, pebaked_products sig (meat, confectionery, baked products)
+- age + sex + month + % energy questions (no clr-transform): 14.9% of variance, no sig
+- age + sex + month + % energy questions (clr-transform): 18.3% of variance, pealt sig (alternative proteins)
+
+**Best model**:
+- age + sex + month + top 3 PCs (clr-transform): 19.1% of variance, PC3 sig
+- compare to having month as a random effect (age + sex + month + top 3 PCs (clr-transform))
+  - fixed effect: AIC = 2108
+  - random effect: AIC = 2097
+
+**Conclude**
+
+- clr-transform improves variance explained
+- top 3 PCs - better bang for buck, give (a little) more variance than all of the % energy questions combined
+
+**Age + sex + top 3 PCs from clr data**
+
+```{r}
+
+diet$proforma_sex <- as.factor(diet$proforma_sex)
+
+richness.df <- data.frame(MG_SampleID = colnames(taxa_count)[3:ncol(taxa_count)], richness0 = richness(taxa_count[,3:ncol(taxa_count)], detection = 0)[,1])
+richness.df <- plyr::join(richness.df, diet, by = "MG_SampleID", type = "inner")
+
+richness_full.df <- richness.df
+
+keep <- c("PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe")
+tmp <- data.frame(richness0 = richness.df$richness0, richness.df[,c("age", "proforma_sex")], richness.df[,keep])
+tmp.rm <- which(is.na(tmp$PC1_diet_pe))
+richness.lm <- lm(richness0 ~ ., tmp[-tmp.rm,])
+summary(richness.lm)
+richness.residuals <- data.frame(MG_SampleID = richness.df$MG_SampleID[-tmp.rm], richness_residuals = richness.lm$residuals)
+richness.df <- plyr::join(richness.df, richness.residuals, by = "MG_SampleID", type = "inner")
+
+# participant_type_study
+oneway.test(richness_residuals ~ participant_type_study, data = richness.df)
+
+ggplot(richness.df, aes(x = participant_type_study, y = richness_residuals, colour = participant_type_study)) + geom_boxplot()
+
+# participant_type
+oneway.test(richness_residuals ~ participant_type, data = richness.df)
+
+ggplot(richness.df, aes(x = participant_type, y = richness_residuals, colour = participant_type)) + geom_boxplot()
+
+```
+
+
+#### Correlation matrix of richness by dietary PC by group
+
+- This plot examines the relationship between dietary PCs and richness, stratified by the study groups
+- Rows are for each dietary PC (with age and sex regressed out)
+- Columns are for each study group
+- x-axis is the value along each PC
+- y-axis is the richness
+- See a positive correlation in PC3 (reflected in the linear model above) 
+
+```{r}
+
+richness.df.gg <- richness.df
+richness.df.gg$richness_resid_age_sex <- lm(richness0 ~ proforma_sex + age, data = richness.df.gg)$residuals
+richness.df.gg <- richness.df.gg %>% dplyr::select(c("participant_type_study", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "richness_resid_age_sex"))
+richness.df.gg <- melt(richness.df.gg, id.vars = c("participant_type_study", "richness_resid_age_sex"), variable.name = "PC", value.name = "PC_value")
+
+ggplot(richness.df.gg, aes(x=PC_value, y=richness_resid_age_sex, colour=participant_type_study)) +
+	geom_point() +
+	geom_smooth(method="lm", se = TRUE, colour = "black") +
+  facet_grid(cols = vars(participant_type_study), rows = vars(PC))
+
+```
+
+### Shannon index + Simpson index
+
+#### No covariates
+
+```{r}
+
+diversity.df <- data.frame(MG_SampleID = colnames(taxa_count)[3:ncol(taxa_count)], shannon =  vegan::diversity(taxa_count_t[,2:ncol(taxa_count_t)], "shannon"), simpson = vegan::diversity(taxa_count_t[,2:ncol(taxa_count_t)], "simpson"))
+diversity.df <- plyr::join(diversity.df, diet, by = "MG_SampleID", type = "inner")
+
+# - Shannon
+oneway.test(shannon ~ participant_type_study, data = diversity.df)
+ggplot(diversity.df, aes(x = participant_type_study, y = shannon, colour = participant_type_study)) + geom_boxplot()
+# - Simpson
+oneway.test(simpson ~ participant_type_study, data = diversity.df)
+ggplot(diversity.df, aes(x = participant_type_study, y = simpson, colour = participant_type_study)) + geom_boxplot()
+
+# ASD/SIB/UNR
+# - Shannon
+oneway.test(shannon ~ participant_type, data = diversity.df)
+ggplot(diversity.df, aes(x = participant_type, y = shannon, colour = participant_type)) + geom_boxplot()
+# - Simpson
+oneway.test(simpson ~ participant_type, data = diversity.df)
+ggplot(diversity.df, aes(x = participant_type, y = simpson, colour = participant_type)) + geom_boxplot()
+
+```
+
+#### Covariates
+
+**Age + sex + top 3 PCs from clr data**
+
+- regress diversity ~ age + sex + PCs
+- age, sex and PC3
+- find that the difference between groups is removed after adjusting for covariates
+
+```{r}
+
+diet$proforma_sex <- as.factor(diet$proforma_sex)
+
+diversity.df <- data.frame(MG_SampleID = colnames(taxa_count)[3:ncol(taxa_count)], shannon = vegan::diversity(as.matrix(taxa_count_t[,2:ncol(taxa_count_t)]), "shannon"), simpson = vegan::diversity(as.matrix(taxa_count_t[,2:ncol(taxa_count_t)]), "simpson"))
+diversity.df <- plyr::join(diversity.df, diet, by = "MG_SampleID", type = "inner")
+
+# Regress covariates from Shannon index
+keep <- c("PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe")
+tmp <- data.frame(shannon = diversity.df$shannon, diversity.df[,c("age", "proforma_sex")], diversity.df[,keep])
+tmp.rm <- which(is.na(tmp$PC1_diet_pe))
+diversity.lm <- lm(shannon ~ ., tmp[-tmp.rm,])
+summary(diversity.lm)
+diversity.residuals <- data.frame(MG_SampleID = diversity.df$MG_SampleID[-tmp.rm], shannon_residuals = diversity.lm$residuals)
+diversity.df <- plyr::join(diversity.df, diversity.residuals, by = "MG_SampleID", type = "left")
+
+# Regress covariates from Simpson index
+keep <- c("PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe")
+tmp <- data.frame(simpson = diversity.df$simpson, diversity.df[,c("age", "proforma_sex")], diversity.df[,keep])
+tmp.rm <- which(is.na(tmp$PC1_diet_pe))
+diversity.lm <- lm(simpson ~ ., tmp)
+summary(diversity.lm)
+diversity.residuals <- data.frame(MG_SampleID = diversity.df$MG_SampleID[-tmp.rm], simpson_residuals = diversity.lm$residuals)
+diversity.df <- plyr::join(diversity.df, diversity.residuals, by = "MG_SampleID", type = "left")
+
+# By study
+oneway.test(shannon_residuals ~ participant_type_study, data = diversity.df)
+ggplot(diversity.df, aes(x = participant_type_study, y = shannon_residuals, colour = participant_type_study)) + geom_boxplot()
+oneway.test(simpson_residuals ~ participant_type_study, data = diversity.df)
+ggplot(diversity.df, aes(x = participant_type_study, y = simpson_residuals, colour = participant_type_study)) + geom_boxplot()
+
+# By group
+oneway.test(shannon ~ participant_type, data = diversity.df)
+ggplot(diversity.df, aes(x = participant_type, y = shannon, colour = participant_type)) + geom_boxplot()
+oneway.test(shannon ~ participant_type, data = diversity.df)
+ggplot(diversity.df, aes(x = participant_type, y = simpson, colour = participant_type)) + geom_boxplot()
+oneway.test(shannon_residuals ~ participant_type, data = diversity.df)
+ggplot(diversity.df, aes(x = participant_type, y = shannon_residuals, colour = participant_type)) + geom_boxplot()
+oneway.test(simpson_residuals ~ participant_type, data = diversity.df)
+ggplot(diversity.df, aes(x = participant_type, y = simpson_residuals, colour = participant_type)) + geom_boxplot()
+
+```
+
+#### Sensitivity analyses
+
+```{r}
+
+# Effect of SIB
+oneway.test(shannon ~ participant_type, data = diversity.df %>% filter(participant_type != "SIB"))
+oneway.test(shannon_residuals ~ participant_type, data = diversity.df %>% filter(participant_type != "SIB"))
+
+# Effect of antibiotics
+oneway.test(shannon ~ participant_type, data = diversity.df %>% filter(!meds_antibiotic_current == 1))
+oneway.test(shannon_residuals ~ participant_type, data = diversity.df %>% filter(!meds_antibiotic_current == 1))
+
+# Test each covariate
+summary(aov(shannon ~ age + proforma_sex + participant_type, data = diversity.df))
+summary(aov(shannon ~ age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe + participant_type, data = diversity.df))
+
+# Effect of probiotics (not one-way test this time)
+summary(aov(shannon ~ as.factor(cam_probiotic) + participant_type, data = diversity.df))
+summary(aov(shannon ~ as.factor(cam_probiotic) + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe + participant_type, data = diversity.df))
+
+# Effect of removing QTAB
+diversity_u10.df <- diversity.df %>% filter(age <= 10) %>% filter(participant_type_study != "UNR_QTAB")
+#summary(lm(shannon ~ participant_type_study, data = diversity_u10.df))
+#summary(lm(shannon ~ participant_type_study + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diversity_u10.df))
+oneway.test(shannon ~ participant_type, data = diversity_u10.df)
+oneway.test(shannon_residuals ~ participant_type, diversity_u10.df)
+
+# Effect of removing those with <7M reads
+diversity_rarefy.df <- diversity.df %>% filter(!MG_SampleID %in% rm_rarefy)
+#summary(lm(shannon ~ participant_type, data = diversity_rarefy.df))
+#anova(lm(shannon ~ participant_type, data = diversity_rarefy.df))
+#summary(lm(shannon ~ participant_type + age + proforma_sex, data = diversity_rarefy.df))
+#anova(lm(shannon ~ participant_type + age + proforma_sex, data = diversity_rarefy.df))
+#summary(lm(shannon ~ participant_type + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diversity_rarefy.df))
+#anova(lm(shannon ~ participant_type + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diversity_rarefy.df))
+oneway.test(shannon ~ participant_type, data = diversity.df %>% filter(!MG_SampleID %in% rm_rarefy))
+oneway.test(shannon_residuals ~ participant_type, data = diversity.df %>% filter(!MG_SampleID %in% rm_rarefy))
+
+# Effect of only including paired siblings
+diversity_pairs.df <- diversity.df %>% filter(MG_FID != 0)
+oneway.test(shannon ~ participant_type, data = diversity_pairs.df)
+oneway.test(shannon_residuals ~ participant_type, data = diversity_pairs.df)
+# - random effect
+summary(aov(shannon ~ participant_type + Error(MG_FID), data = diversity_pairs.df))
+summary(aov(shannon_residuals ~ participant_type + Error(MG_FID), data = diversity_pairs.df))
+#summary(lm(shannon ~ participant_type, data = diversity_pairs.df))
+#anova(lm(shannon ~ participant_type, data = diversity_pairs.df))
+#summary(lm(shannon ~ participant_type + age + proforma_sex, data = diversity_pairs.df))
+#anova(lm(shannon ~ participant_type + age + proforma_sex, data = diversity_pairs.df))
+#summary(lm(shannon ~ participant_type + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diversity_pairs.df))
+#anova(lm(shannon ~ participant_type + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diversity_pairs.df))
+summary(aov(shannon ~ participant_type + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe + Error(MG_FID), data = diversity_pairs.df))
+
+```
+
+#### Correlation matrix of diversity (Shannon index) by dietary PC by group
+
+- This plot examines the relationship between dietary PCs and diversity (Shannon index), stratified by the study groups
+- Rows are for each dietary PC (with age and sex regressed out)
+- Columns are for each study group
+- x-axis is the value along each PC
+- y-axis is the diversity
+- See a negative correlation in PC3 (reflected in the linear model above) 
+
+```{r}
+
+diversity.df.gg <- diversity.df
+diversity.df.gg$shannon_resid_age_sex <- lm(shannon ~ proforma_sex + age, data = diversity.df.gg)$residuals
+diversity.df.gg <- diversity.df.gg %>% dplyr::select(c("participant_type_study", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "shannon_resid_age_sex"))
+diversity.df.gg <- melt(diversity.df.gg, id.vars = c("participant_type_study", "shannon_resid_age_sex"), variable.name = "PC", value.name = "PC_value")
+
+ggplot(diversity.df.gg, aes(x=PC_value, y=shannon_resid_age_sex, colour=participant_type_study)) +
+	geom_point() +
+	geom_smooth(method="lm", se = TRUE, colour = "black") +
+  facet_grid(cols = vars(participant_type_study), rows = vars(PC))
+
+```
+
+### Beta diversity - weighted Unifrac
+
+- not possible at this point, as I need a phy_tree object (part of phyloseq format)
+    - https://joey711.github.io/phyloseq/import-data.html
+- this, in turn, requires sequence-level data for the various datasets
+- I think I would need Microba to provide files to do this(?)
+
+```{r}
+
+tree_bacteria <- read_tree("/PATH/TO/MGDBv2/mgdb_r89_bac.decorated.sp_labels.pruned.tree")
+
+```
+
+```{r}
+# Format " " to "_"
+taxa_count.tmp <- taxa_count
+taxa_count.tmp$Taxon <- gsub(" ", "_", taxa_count$Taxon)
+# Only take bacteria (ie. no archaea)
+taxa_count_taxan <- taxa_count.tmp$Taxon[which(taxa_count.tmp$Taxon %in% tree_bacteria$tip.label)]
+taxa_count_full <- as.matrix(taxa_count.tmp[which(taxa_count.tmp$Taxon %in% taxa_count_taxan),which(colnames(taxa_count.tmp) %in% diet_full$MG_SampleID)])
+rownames(taxa_count_full) <- taxa_count_taxan
+
+# Format " " to "_"
+taxa_name.tmp <- taxa_name
+taxa_name.tmp$species <- gsub(" ", "_", taxa_name.tmp$species)
+# Only take bacteria (ie. no archaea)
+taxa_name.tmp <- taxa_name.tmp %>% filter(species %in% tree_bacteria$tip.label)
+taxa_name_full <- taxa_name.tmp %>% dplyr::select(c("domain", "phylum", "class", "order", "family", "genus", "species"))
+taxa_name_full <- as.matrix(taxa_name_full)
+rownames(taxa_name_full) <- gsub(" ", "_", taxa_count_taxan)
+
+samp_df <- diet_full
+rownames(samp_df) <- samp_df[,"MG_SampleID"]
+
+otu.mat <- otu_table(taxa_count_full, taxa_are_rows = TRUE)
+tax.mat <- tax_table(taxa_name_full)
+samp.mat <- sample_data(samp_df)
+
+physeq_full <- phyloseq(otu.mat, tax.mat, samp.mat, tree_bacteria)
+unifrac_weighted <- UniFrac(physeq_full, weighted = TRUE)
+
+```
+
+### Beta diversity - Bray-Curtis
+
+#### Full sample
+
+- Colours on the left side demonstrate groups
+- ASD: red
+- SIB: blue
+- UNR: green
+
+```{r}
+
+braycurtis <- as.matrix(vegdist(taxa_count_rm0_t[,2:ncol(taxa_count_rm0_t)], method = "bray"))
+identical(as.character(taxa_count_rm0_t$MG_SampleID), diet$MG_SampleID)
+my_group <- as.numeric(as.factor(diet$participant_type))
+colSide <- brewer.pal(9, "Set1")[my_group]
+colMain <- colorRampPalette(brewer.pal(9, "Blues"))(25)
+heatmap(braycurtis, RowSideColors = colSide, col = colMain)
+
+```
+
+##### PERMANOVA test
+
+- tests whether the compositional "profile" is different
+- uses a pseudo-F-test based on the dissimilarity index (here generated using bray curtis index)
+- H0: centroids of the group are equivalent
+
+```{r}
+
+print("Beta diversity with weighted Unifrac")
+adonis2(unifrac_weighted ~ participant_type_study, data = diet)
+adonis2(unifrac_weighted ~ participant_type, data = diet)
+
+print("... with covariates age and sex")
+adonis2(unifrac_weighted ~ age + proforma_sex + participant_type_study, data = diet)
+adonis2(unifrac_weighted ~ age + proforma_sex + participant_type, data = diet)
+
+print("... with covariates age, sex and dietary pe_PCs")
+adonis2(unifrac_weighted ~ age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe + participant_type_study, data = diet_full)
+adonis2(unifrac_weighted ~ age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe + participant_type, data = diet_full)
+
+```
+
+```{r}
+
+print("Beta diversity with Bray-Curtis index")
+
+print("... by participant_type_study")
+#ind <- data.table(participant_type_study = diet$participant_type_study)
+adonis2(braycurtis ~ participant_type_study, data = diet)
+adonis2(braycurtis ~ age + proforma_sex + participant_type_study, data = diet)
+
+print("... by participant_type")
+#ind <- data.table(participant_type = diet$participant_type)
+adonis2(braycurtis ~ participant_type, data = diet)
+adonis2(braycurtis ~ age + proforma_sex + participant_type, data = diet)
+
+
+```
+
+##### PERMDISP2
+
+- https://forum.qiime2.org/t/adonis-betadiver-and-betadisp/9364/3
+- tests for difference in the spread/variance within a group compared to others (used to test for beta diversity)
+- eg. can test: "are the centroid differences because of inter-group variance?"
+- multivariate analogue of Levene's test for homogeneity of variance
+- non-Euclidean distances between objects and group centroids: handled by reducing original distances to PCs
+- tested ASD/SIB/UNR and ASD/SIB/UNR/UNR_QTAB
+
+```{r}
+
+permdisp2 <- betadisper(unifrac_weighted, diet$participant_type_study)
+anova(permdisp2)
+
+permdisp2 <- betadisper(unifrac_weighted, diet$participant_type)
+anova(permdisp2)
+
+```
+
+```{r}
+
+braycurtis.dist <- as.dist(braycurtis)
+permdisp2 <- betadisper(braycurtis.dist, diet$participant_type_study)
+anova(permdisp2)
+
+braycurtis.dist <- as.dist(braycurtis)
+permdisp2 <- betadisper(braycurtis.dist, diet$participant_type)
+anova(permdisp2)
+
+```
+
+#### Exclude SIB (ASD vs UNR comparison)
+
+```{r}
+
+nosib <- subset_samples(physeq_full, participant_type != "SIB")
+unifrac_weighted_nosib <- UniFrac(nosib, weighted = TRUE)
+
+```
+
+##### PERMANOVA test
+
+- tests whether the compositional "profile" is different
+- uses a pseudo-F-test based on the dissimilarity index (here generated using bray curtis index)
+- H0: centroids of the group are equivalent
+
+```{r}
+
+ind <- data.table(participant_type = sample_data(nosib)$participant_type, age = sample_data(nosib)$age, proforma_sex = sample_data(nosib)$proforma_sex, PC1_diet_pe = sample_data(nosib)$PC1_diet_pe, PC2_diet_pe = sample_data(nosib)$PC2_diet_pe, PC3_diet_pe = sample_data(nosib)$PC3_diet_pe)
+adonis2(unifrac_weighted_nosib ~ participant_type, data = ind)
+adonis2(unifrac_weighted_nosib ~ age + proforma_sex + participant_type, data = ind)
+adonis2(unifrac_weighted_nosib ~ age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe + participant_type, data = ind)
+
+```
+
+##### PERMDISP2
+
+- tests for difference in the spread/variance within a group compared to others (used to test for beta diversity)
+- eg. can test: "are the centroid differences because of inter-group variance?"
+- multivariate analogue of Levene's test for homogeneity of variance
+- non-Euclidean distances between objects and group centroids: handled by reducing original distances to PCs
+- tested all children <=10 and none in QTAB here
+
+```{r}
+
+permdisp2 <- betadisper(unifrac_weighted_ageu10, sample_data(ageu10)$participant_type_study)
+anova(permdisp2)
+
+```
+
+
+#### Sensitivity analysis: Children <= 10yo (n=136 and no QTAB)
+
+```{r}
+
+ageu10 <- subset_samples(physeq_full, age <= 10)
+ageu10 <- subset_samples(ageu10, participant_type_study != "UNR_QTAB")
+unifrac_weighted_ageu10 <- UniFrac(ageu10, weighted = TRUE)
+
+```
+
+##### PERMANOVA test
+
+- tests whether the compositional "profile" is different
+- uses a pseudo-F-test based on the dissimilarity index (here generated using bray curtis index)
+- H0: centroids of the group are equivalent
+
+```{r}
+
+ind <- data.table(participant_type_study = sample_data(ageu10)$participant_type_study, age = sample_data(ageu10)$age, proforma_sex = sample_data(ageu10)$proforma_sex, PC1_diet_pe = sample_data(ageu10)$PC1_diet_pe, PC2_diet_pe = sample_data(ageu10)$PC2_diet_pe, PC3_diet_pe = sample_data(ageu10)$PC3_diet_pe)
+adonis2(unifrac_weighted_ageu10 ~ participant_type_study, data = ind)
+adonis2(unifrac_weighted_ageu10 ~ age + proforma_sex + participant_type_study, data = ind)
+adonis2(unifrac_weighted_ageu10 ~ age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe + participant_type_study, data = ind)
+
+```
+
+##### PERMDISP2
+
+- tests for difference in the spread/variance within a group compared to others (used to test for beta diversity)
+- eg. can test: "are the centroid differences because of inter-group variance?"
+- multivariate analogue of Levene's test for homogeneity of variance
+- non-Euclidean distances between objects and group centroids: handled by reducing original distances to PCs
+- tested all children <=10 and none in QTAB here
+
+```{r}
+
+permdisp2 <- betadisper(unifrac_weighted_ageu10, sample_data(ageu10)$participant_type_study)
+anova(permdisp2)
+
+```
+
+#### Sensitivity analysis: Rarefying to 7M reads
+
+```{r}
+
+rarefy <- subset_samples(physeq_full, !MG_SampleID %in% rm_rarefy)
+unifrac_weighted_rarefy <- UniFrac(rarefy, weighted = TRUE)
+
+```
+
+##### PERMANOVA test
+
+- tests whether the compositional "profile" is different
+- uses a pseudo-F-test based on the dissimilarity index (here generated using bray curtis index)
+- H0: centroids of the group are equivalent
+
+```{r}
+
+ind <- data.table(participant_type = sample_data(rarefy)$participant_type, age = sample_data(rarefy)$age, proforma_sex = sample_data(rarefy)$proforma_sex, PC1_diet_pe = sample_data(rarefy)$PC1_diet_pe, PC2_diet_pe = sample_data(rarefy)$PC2_diet_pe, PC3_diet_pe = sample_data(rarefy)$PC3_diet_pe)
+adonis2(unifrac_weighted_rarefy ~ participant_type, data = ind)
+adonis2(unifrac_weighted_rarefy ~ age + proforma_sex + participant_type, data = ind)
+adonis2(unifrac_weighted_rarefy ~ age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe + participant_type, data = ind)
+
+```
+
+##### PERMDISP2
+
+- tests for difference in the spread/variance within a group compared to others (used to test for beta diversity)
+- eg. can test: "are the centroid differences because of inter-group variance?"
+- multivariate analogue of Levene's test for homogeneity of variance
+- non-Euclidean distances between objects and group centroids: handled by reducing original distances to PCs
+- tested all children <=10 and none in QTAB here
+
+```{r}
+
+permdisp2 <- betadisper(unifrac_weighted_rarefy, sample_data(rarefy)$participant_type)
+anova(permdisp2)
+
+```
+
+#### Sensitivity analysis: ASD-SIB pairs
+
+##### Qualitative similarity
+
+- used the datset removing low-abundance taxa (present in <10 samples)
+- qualitatively see that pairs group
+
+```{r}
+
+pairs <- subset_samples(physeq_full, MG_sibpair == "Y")
+unifrac_weighted_pairs <- UniFrac(pairs, weighted = TRUE)
+
+```
+
+```{r, eval = FALSE}
+
+pairs <- diet %>% filter(MG_sibpair == "Y")
+taxa_count_rm0_t_pairs <- taxa_count_rm0_t %>% filter(MG_SampleID %in% pairs$MG_SampleID)
+
+braycurtis_pairs <- as.matrix(vegdist(taxa_count_rm0_t_pairs[,2:ncol(taxa_count_rm0_t_pairs)], method = "bray"))
+colnames(braycurtis_pairs) <- pairs$MG_SampleID
+rownames(braycurtis_pairs) <- pairs$MG_SampleID
+identical(as.character(taxa_count_rm0_t_pairs$MG_SampleID), pairs$MG_SampleID)
+my_group <- as.numeric(as.factor(pairs$MG_FID))
+colSide <- rainbow_hcl(length(unique(pairs$MG_FID)), c=90, l=65)[my_group]
+#colSide <- brewer.pal(length(unique(pairs$MG_FID)), "Set1")[my_group]
+colMain <- colorRampPalette(brewer.pal(9, "Blues"))(25)
+heatmap(braycurtis_pairs, labRow = pairs$MG_FID, labCol = pairs$MG_FID, RowSideColors = colSide, col = colMain)
+
+```
+
+##### PERMANOVA test
+
+- tests whether the compositional "profile" is different
+- uses a pseudo-F-test based on the dissimilarity index (here generated using bray curtis index)
+- H0: centroids of the group are equivalent
+
+```{r}
+
+ind <- data.table(participant_type = sample_data(pairs)$participant_type, age = sample_data(pairs)$age, proforma_sex = sample_data(pairs)$proforma_sex, PC1_diet_pe = sample_data(pairs)$PC1_diet_pe, PC2_diet_pe = sample_data(pairs)$PC2_diet_pe, PC3_diet_pe = sample_data(pairs)$PC3_diet_pe)
+adonis2(unifrac_weighted_pairs ~ participant_type, data = ind)
+adonis2(unifrac_weighted_pairs ~ age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe + participant_type, data = ind)
+
+```
+
+```{r, eval = FALSE}
+
+ind <- data.table(participant_type_study = pairs$participant_type_study)
+adonis2(braycurtis_pairs ~ participant_type_study, data = ind)
+
+```
+
+##### PERMDISP2
+
+- tests for difference in the spread/variance within a group compared to others (used to test for beta diversity)
+- eg. can test: "are the centroid differences because of inter-group variance?"
+- multivariate analogue of Levene's test for homogeneity of variance
+- non-Euclidean distances between objects and group centroids: handled by reducing original distances to PCs
+- tested ASD/SIB pairs here
+
+```{r}
+
+permdisp2 <- betadisper(unifrac_weighted_pairs, sample_data(pairs)$participant_type_study)
+anova(permdisp2)
+
+```
+
+```{r, eval = FALSE}
+
+braycurtis_pairs.dist <- as.dist(braycurtis_pairs)
+permdisp2 <- betadisper(braycurtis_pairs.dist, pairs$participant_type_study)
+anova(permdisp2)
+
+```
+
+##### Quantify the similarity 
+
+**Compare Bray-Curtis (dissimilarity) index between ASD-SIB pairs to others**
+
+###### Rank test
+
+Test:
+
+- Input dataset: ASD-SIB pairs
+- For each individual:
+    - "Paired rank": ranked the Bray-Curtis index between the pair against all under individuals (removing the diagonal from the calculation)
+    - "Random rank": took a random Bray-Curtis index --> took the rank
+- Wilcoxon rank sum test between the paired rank vs the random rank
+- Find that the ASD-SIB pairs are significantly more likely to cluster together
+
+
+```{r}
+
+unifrac_weighted_pairs.ma <- as.matrix(unifrac_weighted_pairs)
+pairs.df <- data.frame(sample_data(pairs))
+
+out = NULL
+rand = NULL
+full_length <- nrow(pairs.df)-1
+for (i in 1:length(pairs.df$MG_SampleID)) {
+  
+  # Take the index ID
+  iid <- pairs.df$MG_SampleID[i]
+  # Take the index ID's famID
+  fid <- pairs.df[which(pairs.df$MG_SampleID == iid), "MG_FID"]
+  # Take the index ID's sib pair
+  fid_pair <- pairs.df %>% filter(MG_FID == fid) %>% filter(MG_SampleID != pairs.df$MG_SampleID[i])
+  # Find the bray-curtis index between the pair
+  ind <- unifrac_weighted_pairs.ma[iid, fid_pair$MG_SampleID]
+  # Rank the bray-curtis index between the pair within the other indices. Subtract 1 for the diagonal (ie. dissimilarity with oneself)
+  rank <- length(which(unifrac_weighted_pairs.ma[iid,] < ind))-1
+  out <- c(out, rank)
+  
+  # Get a random rank to compare to as a distribution
+  rand.tmp <- sample(unifrac_weighted_pairs.ma[-i,], 1)
+  rand_rank <- length(which(unifrac_weighted_pairs.ma[iid,] < rand.tmp))-1
+  rand <- c(rand, rand_rank)
+  
+}
+
+# Compare
+compare_ids <- melt(data.frame(rank = out, random = rand))
+
+# Outputs
+out_ids <- data.frame(MG_SampleID = pairs.df$MG_SampleID, MG_FID = pairs.df$MG_FID, rank = out)
+out_ids <- out_ids[order(out_ids$MG_FID),]
+
+# Summary
+summary(out/full_length)
+wilcox.test(out, rand)
+
+# Datatable
+datatable(out_ids)
+
+# Table to include the summary statistics on the histogram
+sumstat <- ddply(compare_ids, "variable", summarise, grp.mean = mean(value), grp.median = median(value))
+
+# Histogram
+ggplot(compare_ids, aes(x=value, fill = variable)) + 
+  geom_histogram(binwidth = 2) + 
+  geom_vline(data=sumstat, aes(xintercept=grp.mean, color=variable),
+             linetype="dashed")+
+  geom_vline(data=sumstat, aes(xintercept=grp.median, color=variable),
+             linetype="solid")+
+  ggtitle("Histogram of weighted Unifrac rank between ASD-SIB pairs")
+
+```
+
+```{r, eval = FALSE}
+
+out = NULL
+rand = NULL
+full_length <- nrow(pairs)-1
+for (i in 1:length(pairs$MG_SampleID)) {
+  
+  # Take the index ID
+  iid <- pairs$MG_SampleID[i]
+  # Take the index ID's famID
+  fid <- pairs[which(pairs$MG_SampleID == iid), "MG_FID"]
+  # Take the index ID's sib pair
+  fid_pair <- pairs %>% filter(MG_FID == fid) %>% filter(MG_SampleID != pairs$MG_SampleID[i])
+  # Find the bray-curtis index between the pair
+  ind <- braycurtis_pairs[iid, fid_pair$MG_SampleID]
+  # Rank the bray-curtis index between the pair within the other indices. Subtract 1 for the diagonal (ie. dissimilarity with oneself)
+  rank <- length(which(braycurtis_pairs[iid,] < ind))-1
+  out <- c(out, rank)
+  
+  # Get a random rank to compare to as a distribution
+  rand.tmp <- sample(braycurtis_pairs[-i,], 1)
+  rand_rank <- length(which(braycurtis_pairs[iid,] < rand.tmp))-1
+  rand <- c(rand, rand_rank)
+  
+}
+
+# Compare
+compare_ids <- melt(data.frame(rank = out, random = rand))
+
+# Outputs
+out_ids <- data.frame(MG_SampleID = pairs$MG_SampleID, MG_FID = pairs$MG_FID, rank = out)
+out_ids <- out_ids[order(out_ids$MG_FID),]
+
+# Summary
+summary(out/full_length)
+wilcox.test(out, rand)
+
+# Datatable
+datatable(out_ids)
+
+# Table to include the summary statistics on the histogram
+sumstat <- ddply(compare_ids, "variable", summarise, grp.mean = mean(value), grp.median = median(value))
+
+# Histogram
+ggplot(compare_ids, aes(x=value, fill = variable)) + 
+  geom_histogram(binwidth = 2) + 
+  geom_vline(data=sumstat, aes(xintercept=grp.mean, color=variable),
+             linetype="dashed")+
+  geom_vline(data=sumstat, aes(xintercept=grp.median, color=variable),
+             linetype="solid")+
+  ggtitle("Histogram of Bray-Curtis rank between ASD-SIB pairs")
+
+```
+
+###### Permutation test
+
+```{r}
+
+unifrac_weighted_pairs.ma <- as.matrix(unifrac_weighted_pairs)
+
+# Calculate "observed" Bray-Curtis index
+tmp <- data.table(MG_SampleID = sample_data(pairs)$MG_SampleID, MG_FID = sample_data(pairs)$MG_FID, stringsAsFactors = F)
+fid_uniq <- unique(sample_data(pairs)$MG_FID)
+obs = NULL
+for (i in 1:length(fid_uniq)) {
+  iids <- sample_data(pairs)$MG_SampleID[which(sample_data(pairs)$MG_FID == fid_uniq[i])]
+  obs <- c(obs, unifrac_weighted_pairs.ma[iids[1],iids[2]])
+}
+
+# Permutations
+permut_out <- matrix(nrow = length(unique(sample_data(pairs)$MG_FID)), ncol = 999)
+for (n in 1:999) {
+  # 1. Randomise FIDs
+  tmp <- data.frame(MG_SampleID = sample_data(pairs)$MG_SampleID, FID_tmp = sample(sample_data(pairs)$MG_FID), stringsAsFactors = F)
+  fid_uniq <- unique(sample_data(pairs)$MG_FID)
+
+  # 2. For each pair, take the index ID --> calculate Bray-Curtis index with its pair
+  bc_out = NULL
+  for (i in 1:length(fid_uniq)) {
+    # Find the pairs
+    iids <- tmp$MG_SampleID[which(tmp$FID_tmp == fid_uniq[i])]
+
+    # Find the Unifrac index between the pair
+    ind <- unifrac_weighted_pairs.ma[iids[1],iids[2]]
+    permut_out[i,n] <- ind
+  }
+}
+
+# 3. Repeat the above 1000 times
+
+# 4. For each permutation, take the median ASD-SIB pair Bray-Curtis pair
+uf_permut_med <- apply(permut_out, 2, median)
+uf_obs_med <- median(obs)
+
+# 4. Rank the observed index vs the permutations
+rank <- length(which(uf_permut_med < uf_obs_med))+1
+print(paste("Rank of the observed ASD-SIB pair weighted Unifrac index vs 1000 permutations = ", rank, sep = ""))
+print(paste("p-value = ", rank/1000, sep = ""))
+
+# Histogram
+ggplot(compare_ids, aes(x=value, fill = variable)) + 
+  geom_histogram(binwidth = 2) + 
+  geom_vline(data=sumstat, aes(xintercept=grp.mean, color=variable),
+             linetype="dashed")+
+  geom_vline(data=sumstat, aes(xintercept=grp.median, color=variable),
+             linetype="solid")+
+  ggtitle("Histogram of weighted Unifrac rank between ASD-SIB pairs")
+
+```
+
+
+```{r, eval = FALSE}
+
+# Calculate "observed" Bray-Curtis index
+tmp <- data.table(MG_SampleID = pairs$MG_SampleID, MG_FID = pairs$MG_FID, stringsAsFactors = F)
+fid_uniq <- unique(pairs$MG_FID)
+obs = NULL
+for (i in 1:length(fid_uniq)) {
+  iids <- pairs$MG_SampleID[which(pairs$MG_FID == fid_uniq[i])]
+  obs <- c(obs, braycurtis_pairs[iids[1],iids[2]])
+}
+
+# Permutations
+permut_out <- matrix(nrow = length(unique(pairs$MG_FID)), ncol = 999)
+for (n in 1:999) {
+  # 1. Randomise FIDs
+  tmp <- data.frame(MG_SampleID = pairs$MG_SampleID, FID_tmp = sample(pairs$MG_FID), stringsAsFactors = F)
+  fid_uniq <- unique(pairs$MG_FID)
+
+  # 2. For each pair, take the index ID --> calculate Bray-Curtis index with its pair
+  bc_out = NULL
+  for (i in 1:length(fid_uniq)) {
+    # Find the pairs
+    iids <- tmp$MG_SampleID[which(tmp$FID_tmp == fid_uniq[i])]
+
+    # Find the bray-curtis index between the pair
+    ind <- braycurtis_pairs[iids[1],iids[2]]
+    permut_out[i,n] <- ind
+  }
+}
+
+# 3. Repeat the above 1000 times
+
+# 4. For each permutation, take the median ASD-SIB pair Bray-Curtis pair
+bc_permut_med <- apply(permut_out, 2, median)
+bc_obs_med <- median(obs)
+
+# 4. Rank the observed index vs the permutations
+rank <- length(which(bc_permut_med < bc_obs_med))+1
+print(paste("Rank of the observed ASD-SIB pair Bray-Curtis index vs 1000 permutations = ", rank, sep = ""))
+print(paste("p-value = ", rank/1000, sep = ""))
+
+# Histogram
+ggplot(compare_ids, aes(x=value, fill = variable)) + 
+  geom_histogram(binwidth = 2) + 
+  geom_vline(data=sumstat, aes(xintercept=grp.mean, color=variable),
+             linetype="dashed")+
+  geom_vline(data=sumstat, aes(xintercept=grp.median, color=variable),
+             linetype="solid")+
+  ggtitle("Histogram of Bray-Curtis rank between ASD-SIB pairs")
+
+```
+
+## Shannon food
+
+### Compare groups
+
+## Statistical tests
+
+- ANOVA (unadjusted + adjusted)
+- Levene's test for difference in variance
+- DO see differences! In both means and variance
+
+### Plot
+
+```{r}
+
+# Plot
+diet_diversity.long <- melt(diversity.df, 
+	id.vars = c("IID", "participant_type_study", "participant_type", "age", "proforma_sex"),
+	measure.vars = c("shannon_micro", "shannon_macro", "shannon_food"),
+	variable.name = "diet_variable",
+	value.name = "shannon")
+
+ggplot(diet_diversity.long, 
+	aes(x = participant_type, y = shannon, colour = participant_type)) + 
+	geom_boxplot() +
+	facet_grid(cols = vars(diet_variable))
+
+# Focus on foods
+ggplot(diet_diversity.long %>% filter(diet_variable == "shannon_food"), 
+	aes(x = participant_type, y = shannon, colour = participant_type)) + 
+	geom_boxplot() +
+	facet_grid(cols = vars(diet_variable))
+
+ggplot(diet_diversity.long %>% filter(diet_variable == "shannon_food") %>% mutate(participant_type_study = replace(participant_type_study, participant_type_study == "UNR", "UNR_AAB")), 
+	aes(x = participant_type_study, y = shannon, colour = participant_type_study)) + 
+	geom_boxplot() +
+	facet_grid(cols = vars(diet_variable))
+
+```
+
+### Test
+
+#### Shannon food
+
+```{r}
+
+# ANOVA
+# 1-way ANOVA
+
+# Unadjusted for covariates
+oneway.test(shannon_food ~ participant_type, data = diversity.df)
+
+# Adjusted
+food_diversity <- diversity.df %>% filter(!is.na(shannon_food))
+food_diversity$shannon_food_resid <- residuals(lm(shannon_food ~ age + as.factor(proforma_sex), data = food_diversity))
+
+oneway.test(shannon_food_resid ~ participant_type, data = food_diversity)
+
+# Levene's test for difference in variance
+leveneTest(shannon_food_resid ~ participant_type, data = food_diversity)
+
+# Check effect of each covariate
+summary(aov(shannon_food ~ age + proforma_sex + participant_type, data = food_diversity))
+summary(aov(shannon_food ~ age + proforma_sex + energy + participant_type, data = food_diversity))
+
+diversity.df$group <- diversity.df$participant_type
+diversity.df$sex <- diversity.df$proforma_sex
+shannon_food_energy_age_sex.lm <- lm(shannon_food ~ age + proforma_sex + group + energy, data = diversity.df)
+summary(shannon_food_energy_age_sex.lm)
+
+# Effect of excluding SIB
+oneway.test(shannon_food_resid ~ participant_type, data = food_diversity %>% filter(participant_type != "SIB"))
+
+# Effect of excluding QTAB, age>10
+oneway.test(shannon_food_resid ~ participant_type, data = food_diversity %>% filter(participant_type_study != "UNR_QTAB") %>% filter(age <= 10))
+
+# Effect of excluding <7M reads
+oneway.test(shannon_food_resid ~ participant_type, data = food_diversity %>% filter(!MG_SampleID %in% rm_rarefy))
+
+# Effect of including only sibling pairs
+summary(aov(shannon_food ~ participant_type + Error(MG_FID), data = food_diversity %>% filter(MG_FID != 0)))
+oneway.test(shannon_food_resid ~ participant_type, data = food_diversity %>% filter(MG_FID != 0))
+summary(aov(shannon_food_resid ~ participant_type + Error(MG_FID), data = food_diversity %>% filter(MG_FID != 0)))
+
+```
+
+```{r}
+
+# Plot
+# Arrange colours
+cols <- brewer.pal(n = 8, name = "Dark2")
+cols_asd <- brewer.pal(n = 5, name = "Set1")[5]
+cols_base <- cols[c(2,4)]
+cols_food <- cols[5]
+cols_taxa <- cols[6]
+cols_bsc <- cols[8]
+cols_group <- c(cols_asd, cols[1], cols[3]) # orange, green, purple
+cols_food_energy <- c(cols_base, cols_group[2:3], cols_bsc)
+
+ggstatsplot::ggcoefstats(shannon_food_energy_age_sex.lm,
+  title = "Dietary diversity (Shannon)", stats.label.color = cols_food_energy, 
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15))
+
+
+```
+
+#### ARFS
+
+```{r}
+
+# ANOVA
+# 1-way ANOVA
+
+# Unadjusted for covariates
+oneway.test(ARFS ~ participant_type, data = diversity.df)
+
+# Adjusted
+arfs_diversity <- diversity.df %>% filter(!is.na(ARFS))
+arfs_diversity$ARFS_resid <- residuals(lm(ARFS ~ age + as.factor(proforma_sex), data = arfs_diversity))
+
+oneway.test(ARFS_resid ~ participant_type, data = arfs_diversity)
+
+arfs.aov <- aov(ARFS_resid ~ participant_type, data = arfs_diversity)
+summary(arfs.aov)
+arfs_diversity <- diversity.df %>% filter(!is.na(ARFS))
+arfs_diversity$ARFS_resid <- residuals(lm(ARFS ~ age + as.factor(proforma_sex), data = arfs_diversity))
+arfs.aov <- aov(ARFS_resid ~ participant_type_study, data = arfs_diversity)
+summary(arfs.aov)
+
+# Levene's test for difference in variance
+leveneTest(ARFS_resid ~ participant_type, data = arfs_diversity)
+
+```
+
+### Plot after adjusting for covariates
+
+#### Shannon
+
+```{r}
+
+# Plot
+diet_diversity.long <- melt(food_diversity, 
+	id.vars = c("IID", "participant_type_study", "participant_type", "age", "proforma_sex"),
+	measure.vars = c("shannon_food", "shannon_food_resid"),
+	variable.name = "diet_variable",
+	value.name = "shannon_food_resid")
+
+# Focus on foods
+ggplot(diet_diversity.long %>% filter(diet_variable == "shannon_food_resid"), 
+	aes(x = participant_type, y = shannon_food_resid, colour = participant_type)) + 
+	geom_boxplot()
+
+ggplot(diet_diversity.long %>% filter(diet_variable == "shannon_food_resid") %>% mutate(participant_type_study = replace(participant_type_study, participant_type_study == "UNR", "UNR_AAB")), 
+	aes(x = participant_type_study, y = shannon_food_resid, colour = participant_type_study)) + 
+	geom_boxplot()
+
+```
+
+#### ARFS
+
+```{r}
+
+# Plot
+arfs_diversity.long <- melt(arfs_diversity, 
+	id.vars = c("IID", "participant_type_study", "participant_type", "age", "proforma_sex"),
+	measure.vars = c("ARFS", "ARFS_resid"),
+	variable.name = "diet_variable",
+	value.name = "ARFS_resid")
+
+# Focus on foods
+ggplot(arfs_diversity.long %>% filter(diet_variable == "ARFS_resid"), 
+	aes(x = participant_type, y = ARFS_resid, colour = participant_type)) + 
+	geom_boxplot()
+
+ggplot(arfs_diversity.long %>% filter(diet_variable == "ARFS_resid") %>% mutate(participant_type_study = replace(participant_type_study, participant_type_study == "UNR", "UNR_AAB")), 
+	aes(x = participant_type_study, y = ARFS_resid, colour = participant_type_study)) + 
+	geom_boxplot()
+
+```
+
+### Correlate between siblings
+
+- look for correlation in food (and taxonomic) diversity between sibling pairs
+
+#### Shannon
+
+```{r}
+
+food_diversity.fid <- food_diversity %>% filter(MG_FID != 0)
+food_diversity.fid.asd <- food_diversity.fid %>% filter(participant_type == "ASD") %>% dplyr::select(c("MG_SampleID", "IID", "participant_type", "shannon", "shannon_residuals", "shannon_food", "shannon_food_resid", "MG_FID"))
+food_diversity.fid.asd <- food_diversity.fid.asd[order(food_diversity.fid.asd$MG_FID),]
+food_diversity.fid.sib <- food_diversity.fid %>% filter(participant_type == "SIB") %>% dplyr::select(c("MG_SampleID", "IID", "participant_type", "shannon", "shannon_residuals", "shannon_food", "shannon_food_resid", "MG_FID"))
+food_diversity.fid.sib <- food_diversity.fid.sib[order(food_diversity.fid.sib$MG_FID),]
+identical(food_diversity.fid.asd$MG_FID, food_diversity.fid.sib$MG_FID)
+
+food_diversity.fid <- data.frame(shannon_food_ASD = food_diversity.fid.asd$shannon_food, 
+                                 shannon_food_SIB = food_diversity.fid.sib$shannon_food, 
+                                 shannon_taxa_ASD = food_diversity.fid.asd$shannon, 
+                                 shannon_taxa_SIB = food_diversity.fid.sib$shannon,
+                                 shannon_food_resid_ASD = food_diversity.fid.asd$shannon_food_resid, 
+                                 shannon_food_resid_SIB = food_diversity.fid.sib$shannon_food_resid, 
+                                 shannon_taxa_resid_ASD = food_diversity.fid.asd$shannon_residuals, 
+                                 shannon_taxa_resid_SIB = food_diversity.fid.sib$shannon_residuals)
+
+cor.test(food_diversity.fid$shannon_food_ASD, food_diversity.fid$shannon_food_SIB)
+cor.test(food_diversity.fid$shannon_taxa_ASD, food_diversity.fid$shannon_taxa_SIB)
+cor.test(food_diversity.fid$shannon_food_resid_ASD, food_diversity.fid$shannon_food_resid_SIB)
+cor.test(food_diversity.fid$shannon_taxa_resid_ASD, food_diversity.fid$shannon_taxa_resid_SIB)
+
+food_diversity.fid_noresid.gg <- ggstatsplot::ggscatterstats(
+  data = food_diversity.fid,
+  x = shannon_food_ASD,
+  y = shannon_food_SIB,
+  xlab = "ASD shannon food",
+  ylab = "SIB shannon food",
+  title = "Sibling pairs and food diversity (Shannon Index)",
+  messages = FALSE
+)
+
+food_diversity.fid_noresid.gg
+
+taxa_diversity.fid_noresid.gg <- ggstatsplot::ggscatterstats(
+  data = food_diversity.fid,
+  x = shannon_taxa_ASD,
+  y = shannon_taxa_SIB,
+  xlab = "ASD shannon taxonomic",
+  ylab = "SIB shannon taxonomic",
+  title = "Sibling pairs and taxonomic diversity (Shannon Index)",
+  messages = FALSE
+)
+
+taxa_diversity.fid_noresid.gg
+
+food_diversity.fid_resid.gg <- ggstatsplot::ggscatterstats(
+  data = food_diversity.fid,
+  x = shannon_food_resid_ASD,
+  y = shannon_food_resid_SIB,
+  xlab = "ASD shannon food (residuals)",
+  ylab = "SIB shannon food (residuals)",
+  title = "Sibling pairs and food diversity (Shannon Index)",
+  messages = FALSE
+)
+food_diversity.fid_resid.gg
+
+taxa_diversity.fid_resid.gg <- ggstatsplot::ggscatterstats(
+  data = food_diversity.fid,
+  x = shannon_taxa_resid_ASD,
+  y = shannon_taxa_resid_SIB,
+  xlab = "ASD shannon taxonomic (residuals)",
+  ylab = "SIB shannon taxonomic (residuals)",
+  title = "Sibling pairs and taxonomic diversity (Shannon Index)",
+  messages = FALSE
+)
+taxa_diversity.fid_resid.gg
+# Dietary diversity boxplot
+# - Shannon food
+food_diversity.tmp <- food_diversity %>% filter(MG_FID != 0) %>% dplyr::select(c("participant_type", "shannon_food", "shannon_food_resid", "shannon", "shannon_residuals", "age", "proforma_sex", "MG_FID"))
+
+ggstatsplot::ggbetweenstats(
+  data = food_diversity.tmp,
+  x = participant_type,
+  y = shannon_food_resid,
+  #pairwise.comparisons = TRUE,
+  #pairwise.display = "all",
+  #results.subtitle = FALSE,
+  #var.equal = FALSE,
+  xlab = "Group",
+  ylab = "Dietary diversity residuals",
+  title = "Dietary diversity (covariates: age, sex)",
+  ggplot.component = list(ggplot2::scale_color_manual(values = cols_group)),
+  bf.message = FALSE, messages = FALSE
+)
+
+# Statistics
+summary(aov(shannon ~ participant_type, data = food_diversity.tmp))
+summary(aov(shannon ~ Error(MG_FID) + participant_type, data = food_diversity.tmp))
+summary(aov(shannon ~ age + proforma_sex + participant_type, data = food_diversity.tmp))
+summary(aov(shannon ~ age + proforma_sex + Error(MG_FID) + participant_type, data = food_diversity.tmp))
+
+summary(aov(shannon_food ~ participant_type, data = food_diversity.tmp))
+summary(aov(shannon_food ~ Error(MG_FID) + participant_type, data = food_diversity.tmp))
+summary(aov(shannon_food ~ age + proforma_sex + participant_type, data = food_diversity.tmp))
+summary(aov(shannon_food ~ age + proforma_sex + Error(MG_FID) + participant_type, data = food_diversity.tmp))
+
+
+```
+
+#### ARFS
+
+```{r}
+
+arfs_diversity.fid <- arfs_diversity %>% filter(MG_FID != 0)
+arfs_diversity.fid.asd <- arfs_diversity.fid %>% filter(participant_type == "ASD") %>% dplyr::select(c("MG_SampleID", "IID", "participant_type", "shannon", "ARFS", "MG_FID"))
+arfs_diversity.fid.asd <- arfs_diversity.fid.asd[order(arfs_diversity.fid.asd$MG_FID),]
+arfs_diversity.fid.sib <- arfs_diversity.fid %>% filter(participant_type == "SIB") %>% dplyr::select(c("MG_SampleID", "IID", "participant_type", "shannon", "ARFS", "MG_FID"))
+arfs_diversity.fid.sib <- arfs_diversity.fid.sib[order(arfs_diversity.fid.sib$MG_FID),]
+identical(arfs_diversity.fid.asd$MG_FID, arfs_diversity.fid.sib$MG_FID)
+
+arfs_diversity.fid <- data.frame(ARFS_ASD = arfs_diversity.fid.asd$ARFS, 
+                                 ARFS_SIB = arfs_diversity.fid.sib$ARFS, 
+                                 shannon_taxa_ASD = arfs_diversity.fid.asd$shannon, 
+                                 shannon_taxa_SIB = arfs_diversity.fid.sib$shannon)
+
+cor.test(arfs_diversity.fid$ARFS_ASD, arfs_diversity.fid$ARFS_SIB)
+cor.test(arfs_diversity.fid$shannon_taxa_ASD, arfs_diversity.fid$shannon_taxa_SIB)
+
+arfs.fid_noresid.gg <- ggstatsplot::ggscatterstats(
+  data = arfs_diversity.fid,
+  x = ARFS_ASD,
+  y = ARFS_SIB,
+  xlab = "ASD Aus Rec Food Score (ARFS)",
+  ylab = "SIB Aus Rec Food Score (ARFS)",
+  title = "Sibling pairs and ARFS",
+  messages = FALSE
+)
+arfs.fid_noresid.gg
+
+ggstatsplot::ggscatterstats(
+  data = arfs_diversity.fid,
+  x = shannon_taxa_ASD,
+  y = shannon_taxa_SIB,
+  xlab = "ASD shannon taxonomic",
+  ylab = "SIB shannon taxonomic",
+  title = "Sibling pairs and taxonomic diversity (Shannon Index)",
+  messages = FALSE
+)
+
+```
+
+### Shannon index of taxonomic data ~ Shannon index of food data
+
+**Look within entire sample**
+
+- between raw Shannon index (taxonomic + food)
+- between age + sex adjusted Shannon index (taxonomic + food)
+- between age + sex + group adjusted Shannon index (taxonomic + food)
+- **See a positive correlation between taxonomic and food Shannon index**
+
+**Prep new variables with nicer naming**
+
+```{r}
+
+# Edit names
+diversity_full.df <- diversity.df
+diversity.df <- diversity.df %>% filter(!is.na(shannon_food))
+diversity.df$bristol_stool_chart_regroup <- as.numeric(diversity.df$bristol_stool_chart_regroup)
+
+# Edit names of variables to look better on plot
+diversity.df$group <- diversity.df$participant_type
+diversity.df$sex <- diversity.df$proforma_sex
+diversity.df$shannon_taxa <- diversity.df$shannon
+diversity.df$rBSC <- diversity.df$bristol_stool_chart_regroup
+diversity.df$diet_PC1 <- diversity.df$PC1_diet_pe
+diversity.df$diet_PC2 <- diversity.df$PC2_diet_pe
+diversity.df$diet_PC3 <- diversity.df$PC3_diet_pe
+colnames(diversity.df)[which(colnames(diversity.df) == "ados2g_rrb")] <- "ados2g_rrb_ncss"
+colnames(diversity.df)[which(colnames(diversity.df) == "ados2g_sa")] <- "ados2g_sa_ncss"
+colnames(diversity.df)[which(colnames(diversity.df) == "ados2g_rrb_css")] <- "ados2g_rrb"
+colnames(diversity.df)[which(colnames(diversity.df) == "ados2g_sa_css")] <- "ados2g_sa"
+
+```
+
+**Plots for figure**
+
+```{r, fig.height = 8, fig.width = 8}
+
+cor.test(diversity.df$shannon, diversity.df$shannon_food)
+cor.test(diversity.df$shannon, diversity.df$ARFS)
+
+# Arrange colours
+cols <- brewer.pal(n = 8, name = "Dark2")
+cols_asd <- brewer.pal(n = 5, name = "Set1")[5]
+cols_base <- cols[c(2,4)]
+cols_food <- cols[5]
+cols_taxa <- cols[6]
+cols_group <- c(cols_asd, cols[1], cols[3]) # orange, green, purple
+cols_rrb <- cols[7]
+
+```
+
+**Dietary diversity Shannon**
+
+```{r}
+
+# Dietary diversity boxplot
+# - Shannon food
+diet_diversity_box <- ggstatsplot::ggbetweenstats(
+  data = food_diversity,
+  x = participant_type,
+  y = shannon_food_resid,
+  pairwise.comparisons = FALSE,
+  #pairwise.display = "all",
+  #results.subtitle = FALSE,
+  #var.equal = FALSE,
+  xlab = "Group",
+  ylab = "Dietary diversity residuals",
+  #title = "Dietary diversity (covariates: age, sex)",
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::scale_color_manual(values = cols_group), ggplot2::theme(text = element_text(size = 15))),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(text = element_text(size = 18))
+
+diet_diversity_box
+
+# Taxonomic diversity boxplot
+taxa_diversity_box <- ggstatsplot::ggbetweenstats(
+  data = diversity_full.df,
+  x = participant_type,
+  y = shannon_residuals,
+  pairwise.comparisons = FALSE,
+  #results.subtitle = FALSE,
+  #var.equal = FALSE,
+  xlab = "Group",
+  ylab = "Taxonomic diversity residuals",
+  #title = "Taxonomic diversity (covariates: age, sex)",
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::scale_color_manual(values = cols_group), ggplot2::theme(text = element_text(size = 15))),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(text = element_text(size = 18))
+
+taxa_diversity_box
+
+# Dietary vs taxonomic diversity
+# - Shannon food
+cor_diversity <- ggstatsplot::ggscatterstats(
+  data = diversity.df,
+  x = shannon_food,
+  y = shannon,
+  xlab = "Dietary diversity (Shannon)",
+  ylab = "Taxonomic diversity (Shannon)",
+  #title = "Dietary vs taxonomic diversity",
+  marginal.type = "density",
+  marginal.size = 10,
+  xfill = cols_taxa, yfill = cols_food,
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::geom_point(aes(colour = participant_type)), ggplot2::theme(legend.position = "bottom", text = element_text(size = 15)), ggplot2::labs(colour = "Group"), ggplot2::scale_color_manual(values = cols_group)),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(legend.position = "bottom", text = element_text(size = 18))
+
+cor_diversity
+
+# Aggregate into 1 plot
+# - Shannon food
+diversity_box_cor <- ggstatsplot::combine_plots(
+  nrow = 1, ncol = 3,
+  # Dietary diversity
+  diet_diversity_box,
+  # Taxonomic diversity
+  taxa_diversity_box,
+  # Correlation
+  cor_diversity
+)
+
+diversity_box_cor
+
+```
+
+**ARFS**
+
+```{r}
+
+# Dietary diversity boxplot
+# - Shannon food
+diet_diversity_box_arfs <- ggstatsplot::ggbetweenstats(
+  data = arfs_diversity,
+  x = participant_type,
+  y = ARFS_resid,
+  pairwise.comparisons = FALSE,
+  #pairwise.display = "all",
+  #results.subtitle = FALSE,
+  #var.equal = FALSE,
+  xlab = "Group",
+  ylab = "Dietary quality residuals",
+  #title = "Dietary diversity (covariates: age, sex)",
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::scale_color_manual(values = cols_group), ggplot2::theme(text = element_text(size = 15))),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(text = element_text(size = 18))
+
+diet_diversity_box_arfs
+
+# Taxonomic diversity boxplot
+taxa_diversity_box <- ggstatsplot::ggbetweenstats(
+  data = diversity_full.df,
+  x = participant_type,
+  y = shannon_residuals,
+  pairwise.comparisons = FALSE,
+  #results.subtitle = FALSE,
+  #var.equal = FALSE,
+  xlab = "Group",
+  ylab = "Taxonomic diversity residuals",
+  #title = "Taxonomic diversity (covariates: age, sex)",
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::scale_color_manual(values = cols_group), ggplot2::theme(text = element_text(size = 15))),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(text = element_text(size = 18))
+
+taxa_diversity_box
+
+# Dietary vs taxonomic diversity
+# - Shannon food
+cor_diversity_arfs <- ggstatsplot::ggscatterstats(
+  data = arfs_diversity,
+  x = ARFS,
+  y = shannon,
+  xlab = "Dietary quality (ARFS)",
+  ylab = "Taxonomic diversity (Shannon)",
+  #title = "Dietary vs taxonomic diversity",
+  marginal.type = "density",
+  marginal.size = 10,
+  xfill = cols_taxa, yfill = cols_food,
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::geom_point(aes(colour = participant_type)), ggplot2::theme(legend.position = "bottom", text = element_text(size = 15)), ggplot2::labs(colour = "Group"), ggplot2::scale_color_manual(values = cols_group)),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(legend.position = "bottom", text = element_text(size = 18))
+
+cor_diversity_arfs
+
+# Aggregate into 1 plot
+# - Shannon food
+diversity_box_cor_arfs <- ggstatsplot::combine_plots(
+  nrow = 1, ncol = 3,
+  # Dietary diversity
+  diet_diversity_box_arfs,
+  # Taxonomic diversity
+  taxa_diversity_box,
+  # Correlation
+  cor_diversity_arfs
+)
+
+diversity_box_cor_arfs
+
+```
+
+**Taxonomic diversity: other metrics**
+
+```{r}
+
+# Shannon
+taxa_diversity_shan_box <- ggstatsplot::ggbetweenstats(
+  data = diversity_full.df,
+  x = participant_type,
+  y = shannon_residuals,
+  pairwise.comparisons = FALSE,
+  #results.subtitle = FALSE,
+  #var.equal = FALSE,
+  xlab = "Group",
+  ylab = "Shannon diversity residuals",
+  #title = "Taxonomic diversity (covariates: age, sex)",
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::scale_color_manual(values = cols_group), ggplot2::theme(text = element_text(size = 20))),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(text = element_text(size = 18))
+
+taxa_diversity_shan_box
+
+taxa_diversity_shan_box_nocov <- ggstatsplot::ggbetweenstats(
+  data = diversity_full.df,
+  x = participant_type,
+  y = shannon,
+  pairwise.comparisons = FALSE,
+  #results.subtitle = FALSE,
+  #var.equal = FALSE,
+  xlab = "Group",
+  ylab = "Shannon diversity",
+  #title = "Taxonomic diversity (covariates: age, sex)",
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::scale_color_manual(values = cols_group), ggplot2::theme(text = element_text(size = 20))),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(text = element_text(size = 18))
+
+taxa_diversity_shan_box_nocov
+
+# Richness
+taxa_diversity_rich_box <- ggstatsplot::ggbetweenstats(
+  data = richness.df,
+  x = participant_type,
+  y = richness_residuals,
+  pairwise.comparisons = FALSE,
+  #results.subtitle = FALSE,
+  #var.equal = FALSE,
+  xlab = "Group",
+  ylab = "Richness residuals",
+  #title = "Taxonomic diversity (covariates: age, sex)",
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::scale_color_manual(values = cols_group), ggplot2::theme(text = element_text(size = 20))),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(text = element_text(size = 18))
+
+taxa_diversity_rich_box
+
+# Richness
+taxa_diversity_rich_box_nocov <- ggstatsplot::ggbetweenstats(
+  data = richness_full.df,
+  x = participant_type,
+  y = richness0,
+  pairwise.comparisons = FALSE,
+  #results.subtitle = FALSE,
+  #var.equal = FALSE,
+  xlab = "Group",
+  ylab = "Richness",
+  #title = "Taxonomic diversity (covariates: age, sex)",
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::scale_color_manual(values = cols_group), ggplot2::theme(text = element_text(size = 20))),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(text = element_text(size = 18))
+
+taxa_diversity_rich_box_nocov
+
+# Simpson
+taxa_diversity_simp_box <- ggstatsplot::ggbetweenstats(
+  data = diversity_full.df,
+  x = participant_type,
+  y = simpson_residuals,
+  pairwise.comparisons = FALSE,
+  #results.subtitle = FALSE,
+  #var.equal = FALSE,
+  xlab = "Group",
+  ylab = "Simpson diversity residuals",
+  #title = "Taxonomic diversity (covariates: age, sex)",
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::scale_color_manual(values = cols_group), ggplot2::theme(text = element_text(size = 20))),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(text = element_text(size = 18))
+
+taxa_diversity_simp_box
+
+# Simpson
+taxa_diversity_simp_box_nocov <- ggstatsplot::ggbetweenstats(
+  data = diversity_full.df,
+  x = participant_type,
+  y = simpson,
+  pairwise.comparisons = FALSE,
+  #results.subtitle = FALSE,
+  #var.equal = FALSE,
+  xlab = "Group",
+  ylab = "Simpson diversity",
+  #title = "Taxonomic diversity (covariates: age, sex)",
+  ggstatsplot.layer = FALSE,
+  ggplot.component = list(ggplot2::scale_color_manual(values = cols_group), ggplot2::theme(text = element_text(size = 20))),
+  bf.message = FALSE, messages = FALSE
+) #+ ggplot2::theme(text = element_text(size = 18))
+
+taxa_diversity_simp_box_nocov
+
+# Aggregate into 1 plot
+# - Shannon food
+diversity_taxa_box_compar <- ggstatsplot::combine_plots(
+  nrow = 2, ncol = 3,
+  # Shannon
+  taxa_diversity_shan_box,
+  # Richness
+  taxa_diversity_rich_box,
+  # Simpson
+  taxa_diversity_simp_box,
+  # Shannon - nocov
+  taxa_diversity_shan_box_nocov,
+  # Richness - nocov
+  taxa_diversity_rich_box_nocov,
+  # Simpson - nocov
+  taxa_diversity_simp_box_nocov
+)
+
+diversity_taxa_box_compar
+
+```
+
+**Other plots**
+
+```{r}
+ggstatsplot::grouped_ggscatterstats(
+  data = dplyr::filter(
+    .data = diversity.df,
+    participant_type_study %in% c("ASD", "SIB", "UNR", "UNR_QTAB")
+  ),
+  x = shannon,
+  y = shannon_food,
+  xlab = "Taxonomic diversity",
+  ylab = "Dietary diversity",
+  grouping.var = participant_type_study, # grouping variable
+  xfill = "#E69F00",
+  yfill = "#8b3058",
+  ggtheme = ggplot2::theme_grey(),
+  title.prefix = "group",
+  ggplot.component = list(
+    ggplot2::scale_x_continuous(limits=c(min(diversity.df$shannon), max(diversity.df$shannon))),
+    ggplot2::scale_y_continuous(limits=c(min(diversity.df$shannon_food), max(diversity.df$shannon_food)))
+  ),  
+  centrality.parameter = "median", # central tendency lines to be displayed
+  title.text = "Stratify taxonomic vs dietary diversity by group",
+  messages = FALSE
+) 
+
+ggstatsplot::grouped_ggscatterstats(
+  data = dplyr::filter(
+    .data = diversity.df,
+    ASD %in% c("ASD", "nonASD")
+  ),
+  x = shannon,
+  y = shannon_food,
+  xlab = "Taxonomic diversity",
+  ylab = "Dietary diversity",
+  grouping.var = ASD, # grouping variable
+  xfill = "#E69F00",
+  yfill = "#8b3058",
+  ggtheme = ggplot2::theme_grey(),
+  title.prefix = "group",
+  ggplot.component = list(
+    ggplot2::scale_x_continuous(limits=c(min(diversity.df$shannon), max(diversity.df$shannon))),
+    ggplot2::scale_y_continuous(limits=c(min(diversity.df$shannon_food), max(diversity.df$shannon_food)))
+  ),  
+  centrality.parameter = "median", # central tendency lines to be displayed
+  title.text = "Stratify taxonomic vs dietary diversity by group",
+  messages = FALSE
+)
+
+# Taxonomic ~ food diversity
+print("Taxonomic ~ food diversity: general association")
+taxfood.lm <- lm(shannon ~ shannon_food, data = diversity.df)
+summary(taxfood.lm)
+taxfood.coef <- data.frame(variable = rownames(summary(taxfood.lm)$coefficients), yx = "tax_food", analysis = "base", summary(taxfood.lm)$coefficients)
+
+print("Taxonomic ~ food diversity: accounting for sex + participant_type")
+taxfood_sex_group.lm <- lm(shannon ~ shannon_food + sex + group, data = diversity.df)
+summary(taxfood_sex_group.lm)
+taxfood_sex_group.coef <- data.frame(variable = rownames(summary(taxfood_sex_group.lm)$coefficients), yx = "tax_food", analysis = "sex_group", summary(taxfood_sex_group.lm)$coefficients)
+
+print("Taxonomic ~ food diversity: accounting for sex + participant_type + age")
+taxfood_sexage_group.lm <- lm(shannon ~ shannon_food + age + sex + group, data = diversity.df)
+summary(taxfood_sexage_group.lm)
+taxfood_sexage_group.coef <- data.frame(variable = rownames(summary(taxfood_sexage_group.lm)$coefficients), yx = "tax_food", analysis = "sexage_group", summary(taxfood_sexage_group.lm)$coefficients)
+
+print("Taxonomic ~ food diversity: check whether dietary PCs explain anything")
+taxfood_sexage_group_pePC.lm <- lm(shannon ~ shannon_food + age + sex + group + diet_PC1 + diet_PC2 + diet_PC3, data = diversity.df)
+summary(taxfood_sexage_group_pePC.lm)
+taxfood_sexage_group_pePC.coef <- data.frame(variable = rownames(summary(taxfood_sexage_group_pePC.lm)$coefficients), yx = "tax_food", analysis = "sexage_group_dietpePC", summary(taxfood_sexage_group_pePC.lm)$coefficients)
+
+print("Taxonomic ~ food diversity: look for association with bristol stool chart")
+taxfood_sexage_group_pePC_bristol.lm <- lm(shannon ~ shannon_food + age + sex + group + diet_PC1 + diet_PC2 + diet_PC3 + rBSC, data = diversity.df)
+summary(taxfood_sexage_group_pePC_bristol.lm)
+taxfood_sexage_group_pePC_bristol.coef <- data.frame(variable = rownames(summary(taxfood_sexage_group_pePC.lm)$coefficients), yx = "tax_food", analysis = "sexage_group_dietpePC_bristol", summary(taxfood_sexage_group_pePC.lm)$coefficients)
+
+print("Taxonomic ~ food diversity: look for association with bristol stool chart without dietary PC")
+taxfood_sexage_group_bristol.lm <- lm(shannon ~ shannon_food + age + sex + group + rBSC, data = diversity.df)
+summary(taxfood_sexage_group_bristol.lm)
+taxfood_sexage_group_bristol.coef <- data.frame(variable = rownames(summary(taxfood_sexage_group_bristol.lm)$coefficients), yx = "tax_food", analysis = "sexage_group_bristol", summary(taxfood_sexage_group_bristol.lm)$coefficients)
+
+print("Taxonomic ~ food diversity: look for association with bristol stool chart without dietary PC, and with energy")
+taxfood_sexage_group_bristol_energy.lm <- lm(shannon_taxa ~ age + sex + group + rBSC + energy + shannon_food, data = diversity.df)
+summary(taxfood_sexage_group_bristol_energy.lm)
+taxfood_sexage_group_bristol_energy.coef <- data.frame(variable = rownames(summary(taxfood_sexage_group_bristol_energy.lm)$coefficients), yx = "tax_food", analysis = "sexage_group_bristol_energy", summary(taxfood_sexage_group_bristol_energy.lm)$coefficients)
+
+print("Sensitivity analysis excluding current antibiotics: Taxonomic ~ food diversity: accounting for sex + participant_type + age")
+taxfood_sexage_group_noabx.lm <- lm(shannon ~ shannon_food + age + sex + group, data = diversity.df %>% filter(meds_antibiotic_current != 1))
+summary(taxfood_sexage_group_noabx.lm)
+
+print("Sensitivity analysis excluding current antibiotics: Taxonomic ~ food diversity: accounting for sex + participant_type + age + dietary PCs")
+taxfood_sexage_group_pePC_noabx.lm <- lm(shannon ~ shannon_food + age + sex + group + diet_PC1 + diet_PC2 + diet_PC3, data = diversity.df %>% filter(meds_antibiotic_current != 1))
+summary(taxfood_sexage_group_pePC_noabx.lm)
+
+# Food ~ taxonomic diversity
+print("Food ~ taxonomic diversity: general association")
+foodtax.lm <- lm(shannon_food ~ shannon, data = diversity.df)
+summary(foodtax.lm)
+foodtax.coef <- data.frame(variable = rownames(summary(foodtax.lm)$coefficients), yx = "food_tax", analysis = "base", summary(foodtax.lm)$coefficients)
+
+print("Food ~ taxonomic diversity: accounting for sex + participant_type")
+foodtax_sex_group.lm <- lm(shannon_food ~ shannon + sex + group, data = diversity.df)
+summary(taxfood_sex_group.lm)
+foodtax_sex_group.coef <- data.frame(variable = rownames(summary(foodtax_sex_group.lm)$coefficients), yx = "food_tax", analysis = "sex_group", summary(foodtax_sex_group.lm)$coefficients)
+
+print("Food ~ taxonomic diversity: accounting for sex + participant_type + age")
+foodtax_sexage_group.lm <- lm(shannon_food ~ shannon + age + sex + group, data = diversity.df)
+summary(foodtax_sexage_group.lm)
+foodtax_sexage_group.coef <- data.frame(variable = rownames(summary(foodtax_sexage_group.lm)$coefficients), yx = "food_tax", analysis = "sexage_group", summary(foodtax_sexage_group.lm)$coefficients)
+
+print("Food ~ taxonomic diversity: check whether dietary PCs explain anything")
+foodtax_sexage_group_pePC.lm <- lm(shannon_food ~ shannon + age + sex + group + diet_PC1 + diet_PC2 + diet_PC3, data = diversity.df)
+summary(foodtax_sexage_group_pePC.lm)
+foodtax_sexage_group_pePC.coef <- data.frame(variable = rownames(summary(foodtax_sexage_group_pePC.lm)$coefficients), yx = "food_tax", analysis = "sexage_group_dietpePC", summary(foodtax_sexage_group_pePC.lm)$coefficients)
+
+print("Food ~ taxonomic diversity: look for association with bristol stool chart")
+foodtax_sexage_group_pePC_bristol.lm <- lm(shannon_food ~ shannon + age + sex + group + diet_PC1 + diet_PC2 + diet_PC3 + rBSC, data = diversity.df)
+summary(foodtax_sexage_group_pePC_bristol.lm)
+foodtax_sexage_group_pePC_bristol.coef <- data.frame(variable = rownames(summary(foodtax_sexage_group_pePC_bristol.lm)$coefficients), yx = "food_tax", analysis = "sexage_group_dietpePC_bristol", summary(foodtax_sexage_group_pePC_bristol.lm)$coefficients)
+
+print("Food ~ taxonomic diversity: look for association with bristol stool chart without dietary PCs")
+foodtax_sexage_group_bristol.lm <- lm(shannon_food ~ shannon + age + sex + group + rBSC, data = diversity.df)
+summary(foodtax_sexage_group_bristol.lm)
+foodtax_sexage_group_bristol.coef <- data.frame(variable = rownames(summary(foodtax_sexage_group_bristol.lm)$coefficients), yx = "food_tax", analysis = "sexage_group_bristol", summary(foodtax_sexage_group_bristol.lm)$coefficients)
+
+print("Food ~ taxonomic diversity: remove group")
+foodtax_sexage_pePC_bristol.lm <- lm(shannon_food ~ shannon + age + sex + diet_PC1 + diet_PC2 + diet_PC3 + rBSC, data = diversity.df)
+summary(foodtax_sexage_pePC_bristol.lm)
+foodtax_sexage_pePC_bristol.coef <- data.frame(variable = rownames(summary(foodtax_sexage_pePC_bristol.lm)$coefficients), yx = "food_tax", analysis = "sexage_dietpePC_bristol", summary(foodtax_sexage_pePC_bristol.lm)$coefficients)
+
+diversity_food_tax.df <- rbind(taxfood.coef, taxfood_sex_group.coef, taxfood_sexage_group.coef, taxfood_sexage_group_pePC.coef, taxfood_sexage_group_pePC_bristol.coef, foodtax.coef, foodtax_sex_group.coef, foodtax_sexage_group.coef, foodtax_sexage_group_pePC.coef, foodtax_sexage_group_pePC_bristol.coef)
+
+print("Bristol ~ taxonomic diversity")
+bristol_taxa.lm <- lm(rBSC ~ shannon, data = diversity.df)
+summary(bristol_taxa.lm)
+bristol_taxa.coef <- data.frame(variable = rownames(summary(bristol_taxa.lm)$coefficients), yx = "bristol", analysis = "taxa", summary(bristol_taxa.lm)$coefficients)
+
+print("Bristol ~ food diversity")
+bristol_food.lm <- lm(rBSC ~ shannon_food, data = diversity.df)
+summary(bristol_food.lm)
+bristol_food.coef <- data.frame(variable = rownames(summary(bristol_food.lm)$coefficients), yx = "bristol", analysis = "taxa", summary(bristol_food.lm)$coefficients)
+
+print("Bristol ~ taxonomic diversity + covariates")
+bristol_sexage_pePC_group_taxa.lm <- lm(rBSC ~ shannon + age + sex + diet_PC1 + diet_PC2 + diet_PC3 + group, data = diversity.df)
+summary(bristol_sexage_pePC_group_taxa.lm)
+bristol_sexage_pePC_group_taxa.coef <- data.frame(variable = rownames(summary(bristol_sexage_pePC_group_taxa.lm)$coefficients), yx = "bristol", analysis = "sexage_dietpePC_taxa", summary(bristol_sexage_pePC_group_taxa.lm)$coefficients)
+
+print("Bristol ~ food diversity + covariates")
+bristol_sexage_pePC_group_food.lm <- lm(rBSC ~ shannon_food + age + sex + diet_PC1 + diet_PC2 + diet_PC3 + group, data = diversity.df)
+summary(bristol_sexage_pePC_group_food.lm)
+bristol_sexage_pePC_group_food.coef <- data.frame(variable = rownames(summary(bristol_sexage_pePC_group_food.lm)$coefficients), yx = "bristol", analysis = "sexage_dietpePC_food", summary(bristol_sexage_pePC_group_food.lm)$coefficients)
+
+print("Bristol ~ food + taxonomic diversity")
+bristol_taxafood.lm <- lm(rBSC ~ shannon + shannon_food, data = diversity.df)
+summary(bristol_taxafood.lm)
+bristol_taxafood.coef <- data.frame(variable = rownames(summary(bristol_taxafood.lm)$coefficients), yx = "bristol", analysis = "taxa", summary(bristol_taxafood.lm)$coefficients)
+
+print("Bristol ~ taxonomic + food diversity")
+bristol_sexage_pePC_group_taxafood.lm <- lm(rBSC ~ shannon + shannon_food + age + sex + diet_PC1 + diet_PC2 + diet_PC3 + group, data = diversity.df)
+summary(bristol_sexage_pePC_group_taxafood.lm)
+bristol_sexage_pePC_group_taxafood.coef <- data.frame(variable = rownames(summary(bristol_sexage_pePC_group_taxafood.lm)$coefficients), yx = "bristol", analysis = "sexage_dietpePC_taxafood", summary(bristol_sexage_pePC_group_taxafood.lm)$coefficients)
+
+print("Bristol ~ taxonomic + food diversity, no pePCs")
+bristol_sexage_group_taxafood.lm <- lm(bristol_stool_chart_regroup ~ shannon + shannon_food + age + sex + group, data = diversity.df)
+summary(bristol_sexage_group_taxafood.lm)
+bristol_sexage_group_taxafood.coef <- data.frame(variable = rownames(summary(bristol_sexage_group_taxafood.lm)$coefficients), yx = "bristol", analysis = "sexage_taxafood", summary(bristol_sexage_group_taxafood.lm)$coefficients)
+
+diversity_food_tax.df <- rbind(taxfood.coef, taxfood_sex_group.coef, taxfood_sexage_group.coef, taxfood_sexage_group_pePC.coef, taxfood_sexage_group_pePC_bristol.coef, foodtax.coef, foodtax_sex_group.coef, foodtax_sexage_group.coef, foodtax_sexage_group_pePC.coef, foodtax_sexage_group_pePC_bristol.coef, bristol_sexage_group_taxafood.coef)
+
+```
+
+**Plot linear model coefficients and outputs**
+
+```{r, fig.height = 7, fig.width = 12}
+
+# Linear models with "group" (vs "participant_type") to make plots nicer
+#foodtax_sexage_group.lm <- lm(shannon_food ~ age + sex + group + shannon_taxa, data = diversity.df)
+#taxfood_sexage_group.lm <- lm(shannon_taxa ~ age + sex + group + shannon_food, data = diversity.df)
+# - Shannon food
+foodtax_sexage_group_bsc.lm <- lm(shannon_food ~ age + sex + group + rBSC + shannon_taxa, data = diversity.df)
+taxfood_sexage_group_bsc.lm <- lm(shannon_taxa ~ age + sex + group + rBSC + shannon_food, data = diversity.df)
+bristol_sexage_group_taxafood.lm <- lm(bristol_stool_chart_regroup ~ age + sex + group + shannon_taxa + shannon_food, data = diversity.df)
+
+# - ARFS
+foodtax_sexage_group_bsc_arfs.lm <- lm(ARFS ~ age + sex + group + rBSC + shannon_taxa, data = diversity.df)
+taxfood_sexage_group_bsc_arfs.lm <- lm(shannon_taxa ~ age + sex + group + rBSC + ARFS, data = diversity.df)
+bristol_sexage_group_taxafood_arfs.lm <- lm(bristol_stool_chart_regroup ~ age + sex + group + shannon_taxa + ARFS, data = diversity.df)
+
+# Arrange colours
+cols <- brewer.pal(n = 8, name = "Dark2")
+cols_asd <- brewer.pal(n = 5, name = "Set1")[5]
+cols_base <- cols[c(2,4)]
+cols_food <- cols[5]
+cols_taxa <- cols[6]
+cols_bsc <- cols[8]
+cols_group <- c(cols_asd, cols[1], cols[3]) # orange, green, purple
+cols_food_all <- c(cols_base, cols_group[2:3], cols_bsc, cols_food)
+cols_taxa_all <- c(cols_base, cols_group[2:3], cols_bsc, cols_taxa)
+cols_all <- c(cols_base, cols_group[2:3], cols_food, cols_taxa)
+cols_rrb <- cols[7]
+
+# - Shannon food
+lm_coef_diversity <- ggstatsplot::combine_plots(
+  nrow = 1, ncol = 3,
+  # Dietary diversity
+  ggstatsplot::ggcoefstats(foodtax_sexage_group_bsc.lm,
+  title = "Dietary diversity ~", stats.label.color = cols_food_all, 
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)),
+  # Taxonomic diversity
+  ggstatsplot::ggcoefstats(taxfood_sexage_group_bsc.lm,
+  title = "Taxonomic diversity ~", stats.label.color = cols_taxa_all, 
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)),
+  # rBSC
+  ggstatsplot::ggcoefstats(bristol_sexage_group_taxafood.lm,
+  title = "Bristol Stool Chart (regroup) ~", stats.label.color = cols_all, 
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)))
+
+lm_coef_diversity
+
+# - ARFS
+lm_coef_diversity_arfs <- ggstatsplot::combine_plots(
+  nrow = 1, ncol = 3,
+  # Dietary diversity
+  ggstatsplot::ggcoefstats(foodtax_sexage_group_bsc_arfs.lm,
+  title = "Dietary quality (ARFS)", stats.label.color = cols_food_all, 
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)), 
+  # Taxonomic diversity
+  ggstatsplot::ggcoefstats(taxfood_sexage_group_bsc_arfs.lm,
+  title = "Taxonomic diversity", stats.label.color = cols_taxa_all, 
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)),
+  # rBSC
+  ggstatsplot::ggcoefstats(bristol_sexage_group_taxafood_arfs.lm,
+  title = "Bristol Stool Chart (regroup)", stats.label.color = cols_all, 
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15))
+)
+
+lm_coef_diversity_arfs
+
+```
+
+```{r}
+
+# Model coefficients
+# - food ~ taxonomy
+foodtax_sexage_group_pePC_bristol <- ggstatsplot::ggcoefstats(foodtax_sexage_group_pePC_bristol.lm,
+  title = "Dietary diversity ~ Taxonomic diversity", exclude.intercept = TRUE, xlab = NULL, ylab = NULL, stats.label.args = list(size = 4)) + theme(text = element_text(size = 15))
+foodtax_sexage_group_pePC_bristol
+
+ggstatsplot::ggcoefstats(foodtax_sexage_group_pePC_bristol.lm,
+  title = "Dietary diversity ~ Taxonomic diversity", exclude.intercept = TRUE)
+ggstatsplot::ggcoefstats(foodtax_sexage_group_bristol.lm,
+  title = "Dietary diversity ~ Taxonomic diversity", exclude.intercept = TRUE)
+ggstatsplot::ggcoefstats(foodtax_sexage_pePC_bristol.lm,
+  title = "Dietary diversity ~ Taxonomic diversity", exclude.intercept = TRUE)
+ggstatsplot::ggcoefstats(foodtax_sexage_group.lm,
+  title = "Dietary diversity ~ Taxonomic diversity", exclude.intercept = TRUE)
+
+# - taxonomy ~ food
+taxfood_sexage_group_pePC_bristol <- ggstatsplot::ggcoefstats(taxfood_sexage_group_pePC_bristol.lm,
+  title = "Taxonomic diversity ~ Dietary diversity", exclude.intercept = TRUE, xlab = NULL, ylab = NULL, stats.label.args = list(size = 4)) + theme(text = element_text(size = 15))
+taxfood_sexage_group_pePC_bristol
+
+ggstatsplot::ggcoefstats(taxfood_sexage_group_bristol.lm,
+  title = "Taxonomic diversity ~ Dietary diversity", exclude.intercept = TRUE)
+ggstatsplot::ggcoefstats(taxfood_sexage_group.lm,
+  title = "Taxonomic diversity ~ Dietary diversity", exclude.intercept = TRUE)
+
+cols_energy <- c(cols_base, cols_group[2:3], cols_bsc, cols_food, cols_taxa)
+taxfood_sexage_group_bristol_energy <- ggstatsplot::ggcoefstats(taxfood_sexage_group_bristol_energy.lm,
+  title = "Taxonomic diversity ~ Dietary diversity", exclude.intercept = TRUE,
+  stats.label.color = cols_energy, xlab = NULL, ylab = NULL, stats.label.args = list(size = 4)) + theme(text = element_text(size = 15))
+taxfood_sexage_group_bristol_energy
+
+# - bristol ~ taxonomy / food
+ggstatsplot::ggcoefstats(bristol_taxafood.lm,
+  title = "Bristol Stool Chart (regroup) ~ Taxonomic + Dietary diversity", exclude.intercept = TRUE, ylab = NULL, xlab = NULL, stats.label.args = list(size = 4)) + theme(text = element_text(size = 15))
+
+ggstatsplot::ggcoefstats(bristol_sexage_pePC_group_taxa.lm,
+  title = "Bristol Stool Chart (regroup) ~ Taxonomic diversity", exclude.intercept = TRUE, 
+  ylab = NULL, stats.label.args = list(size = 4))  + theme(text = element_text(size = 15))
+
+ggstatsplot::ggcoefstats(bristol_sexage_pePC_group_food.lm,
+  title = "Bristol Stool Chart (regroup) ~ Dietary diversity", exclude.intercept = TRUE, 
+  ylab = NULL, xlab = NULL, stats.label.args = list(size = 4))  + theme(text = element_text(size = 15))
+
+ggstatsplot::ggcoefstats(bristol_sexage_pePC_group_taxafood.lm,
+  title = "Bristol Stool Chart (regroup) ~ Taxonomic + Dietary diversity + pe_PCs", exclude.intercept = TRUE)
+ggstatsplot::ggcoefstats(bristol_sexage_group_taxafood.lm,
+  title = "Bristol Stool Chart (regroup) ~ Taxonomic + Dietary diversity", exclude.intercept = TRUE)
+
+diversity_diet_taxa_sensitivity <- ggstatsplot::combine_plots(
+  nrow = 1, ncol = 3,
+  foodtax_sexage_group_pePC_bristol,
+  taxfood_sexage_group_pePC_bristol,
+  taxfood_sexage_group_bristol_energy
+)
+
+diversity_diet_taxa_sensitivity
+
+```
+
+
+**Stratify ASD and nonASD groups**
+
+- With a simple shannon_food ~ shannon taxonomic analysis
+    - both ASD and nonASD significant
+- Add in all covariates
+    - within the nonASD group: don't see relationship between food shannon and taxonomic shannon
+    - within ASD group, do see relationship still!
+    
+```{r}
+
+diversity_asd.df <- diversity.df %>% filter(participant_type %in% c("ASD"))
+summary(lm(shannon_food ~ shannon, data = diversity_asd.df))
+summary(lm(shannon_food ~ shannon + age + proforma_sex + diet_pePC1 + diet_pePC2 + diet_pePC3 + as.numeric(bristol_stool_chart_regroup), data = diversity_asd.df))
+
+diversity_non.df <- diversity.df %>% filter(participant_type %in% c("SIB", "UNR"))
+summary(lm(shannon_food ~ shannon, data = diversity_non.df))
+summary(lm(shannon_food ~ shannon + age + proforma_sex + diet_pePC1 + diet_pePC2 + diet_pePC3 + as.numeric(bristol_stool_chart_regroup), data = diversity_non.df))
+
+```
+
+#### Causes of dietary restrictedness?
+
+##### Test ADOS RRB
+
+- see significant association between: 
+    - ADOS2/G RRB score ~ shannon_food
+    - ADOS2/G RRB score ~ shannon_taxonomic
+
+```{r}
+
+shannon_food_adosrrb.lm <- lm(shannon_food ~ ados2g_rrb, data = diversity.df)
+summary(shannon_food_adosrrb.lm)
+
+shannon_taxa_adosrrb.lm <- lm(shannon ~ ados2g_rrb, data = diversity.df)
+summary(shannon_taxa_adosrrb.lm)
+
+```
+
+##### Test ADHD-ASD-TS cross-trait analysis PGS
+
+```{r}
+
+diversity.df$pgs_xtrait <- diversity.df$pgs_xtrait_adhd_asd_ts
+
+shannon_food_pgs_xtrait.lm <- lm(shannon_food ~ pgs_xtrait, data = diversity.df)
+summary(shannon_food_pgs_xtrait.lm)
+
+shannon_taxa_pgs_xtrait.lm <- lm(shannon ~ pgs_xtrait, data = diversity.df)
+summary(shannon_taxa_pgs_xtrait.lm)
+
+```
+
+##### Test ADOS2/G social affect
+
+```{r}
+
+shannon_food_adossa.lm <- lm(shannon_food ~ ados2g_sa, data = diversity.df)
+summary(shannon_food_adossa.lm)
+
+shannon_taxa_adossa.lm <- lm(shannon ~ ados2g_sa, data = diversity.df)
+summary(shannon_taxa_adossa.lm)
+
+```
+
+##### Test ASD PGS
+
+- see association between:
+    - ASD PGS and shannon_food (significant)
+    - ASD PGS and shannon_food (marginal)
+- do not see association between ASD PGS and taxonomic shannon
+
+```{r}
+
+shannon_food_pgs_asd.lm <- lm(shannon_food ~ pgs_asd, data = diversity.df)
+summary(shannon_food_pgs_asd.lm)
+
+shannon_taxa_pgs_asd.lm <- lm(shannon ~ pgs_asd, data = diversity.df)
+summary(shannon_taxa_pgs_asd.lm)
+
+```
+
+##### Test ADOS2/G comparison score (ASD group)
+
+- Good infographic here: https://www.pearsonassessments.com/content/dam/school/global/clinical/us/assets/sensoyprofile2/sensory-profile-2-sensory-processing-differences-infographic.pdf
+- Marginally significant with n=92
+
+```{r}
+
+shannon_food_adoscompar.lm <- lm(shannon_food ~ ados2g_compar, data = diversity.df)
+summary(shannon_food_adoscompar.lm)
+
+shannon_taxa_adoscompar.lm <- lm(shannon_taxa ~ ados2g_compar, data = diversity.df)
+summary(shannon_taxa_adoscompar.lm)
+
+```
+
+##### Test SSP (ASD group)
+
+- Good infographic here: https://www.pearsonassessments.com/content/dam/school/global/clinical/us/assets/sensoyprofile2/sensory-profile-2-sensory-processing-differences-infographic.pdf
+- Marginally significant with n=92
+
+```{r}
+
+diversity.df$ssp_sensor <- diversity.df$ssp_sensor_raw
+shannon_food_ssp.lm <- lm(shannon_food ~ ssp_sensor, data = diversity.df)
+summary(shannon_food_ssp.lm)
+
+shannon_taxa_ssp.lm <- lm(shannon ~ ssp_sensor, data = diversity.df)
+summary(shannon_taxa_ssp.lm)
+
+```
+
+##### Test SRS (spectrum measures)
+
+```{r}
+
+shannon_food_srs.lm <- lm(shannon_food ~ srs_tscore, data = diversity.df)
+summary(shannon_food_srs.lm)
+
+shannon_taxa_srs.lm <- lm(shannon ~ srs_tscore, data = diversity.df)
+summary(shannon_taxa_srs.lm)
+
+shannon_food_srs_rrb.lm <- lm(shannon_food ~ srs_rrb_tscore, data = diversity.df)
+summary(shannon_food_srs_rrb.lm)
+
+shannon_taxa_srs_rrb.lm <- lm(shannon ~ srs_rrb_tscore, data = diversity.df)
+summary(shannon_taxa_srs_rrb.lm)
+
+```
+
+##### Test CD4 Tcell count (clr-transformed)
+
+```{r}
+
+shannon_food_CD4T.lm <- lm(shannon_food ~ CD4T_clr, data = diversity.df)
+summary(shannon_food_CD4T.lm)
+
+shannon_taxa_CD4T.lm <- lm(shannon ~ CD4T_clr, data = diversity.df)
+summary(shannon_taxa_CD4T.lm)
+
+```
+
+##### Neuroticism
+
+```{r}
+
+shannon_food_neuroticism.lm <- lm(shannon_food ~ pgs_neuroticism, data = diversity.df)
+summary(shannon_food_neuroticism.lm)
+
+shannon_taxa_neuroticism.lm <- lm(shannon ~ pgs_neuroticism, data = diversity.df)
+summary(shannon_taxa_neuroticism.lm)
+
+```
+
+##### Show plots
+
+```{r, fig.height = 4, fig.width = 12}
+
+# Arrange colours
+cols <- brewer.pal(n = 8, name = "Dark2")
+cols_asd <- brewer.pal(n = 5, name = "Set1")[5]
+cols_base <- cols[c(2,4)]
+cols_food <- cols[5]
+cols_taxa <- cols[6]
+cols_bsc <- cols[8]
+cols_group <- c(cols_asd, cols[1], cols[3]) # orange, green, purple
+cols_food_all <- c(cols_base, cols_group[2:3], cols_bsc, cols_food)
+cols_taxa_all <- c(cols_base, cols_group[2:3], cols_bsc, cols_taxa)
+cols_all <- c(cols_base, cols_group[2:3], cols_food, cols_taxa)
+cols_rrb <- cols[7]
+cols_ssp <- cols[1]
+cols_sa <- cols[3]
+cols_other <- "grey20"
+  
+ggstatsplot::combine_plots(
+  nrow = 2, ncol = 3,
+  # ASD PGS
+  ggstatsplot::ggcoefstats(shannon_food_pgs_asd.lm,
+  title = "Diet ~ ASD polygenic score", stats.label.color = cols_asd,
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)),
+  # ADOS RRB
+  ggstatsplot::ggcoefstats(shannon_food_adosrrb.lm,
+  title = "Diet ~ Restricted/repetitive behaviour", stats.label.color = cols_rrb,
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)),
+  # SSP
+  ggstatsplot::ggcoefstats(shannon_food_ssp.lm,
+  title = "Taxa ~ Sensory score", stats.label.color = cols_ssp,
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)),
+  # # X-trait PGS
+  # ggstatsplot::ggcoefstats(shannon_food_pgs_xtrait.lm,
+  # title = "Diet ~ ADHD-ASD-TS PGS", stats.label.color = cols_rrb,
+  # ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)),
+  
+  # ASD PGS
+  ggstatsplot::ggcoefstats(shannon_taxa_pgs_asd.lm,
+  title = "Taxa ~ ASD polygenic score", stats.label.color = cols_asd,
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)),
+  # ADOS RRB
+  ggstatsplot::ggcoefstats(shannon_taxa_adosrrb.lm,
+  title = "Taxa ~ Restricted/repetitive behaviour", stats.label.color = cols_rrb,
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)),
+  # SSP
+  ggstatsplot::ggcoefstats(shannon_taxa_ssp.lm,
+  title = "Taxa ~ Sensory score", stats.label.color = cols_ssp,
+  ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15))
+  # # X-trait PGS
+  # ggstatsplot::ggcoefstats(shannon_taxa_pgs_xtrait.lm,
+  # title = "Taxa ~ ADHD-ASD-TS PGS", stats.label.color = cols_rrb,
+  # ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15))
+)
+
+
+```
+
+```{r, fig.height = 7, fig.width = 8}
+
+ggstatsplot::combine_plots(
+  nrow = 6, ncol = 2,
+  # ADOS2/G comparison score
+  ggstatsplot::ggcoefstats(shannon_food_adoscompar.lm,
+  title = "Diet ~ ADOS2/G comparison score", stats.label.color = cols_asd, exclude.intercept = T),
+  ggstatsplot::ggcoefstats(shannon_taxa_adoscompar.lm,
+  title = "Taxa ~ ADOS2/G comparison score", stats.label.color = cols_asd, exclude.intercept = T),
+  # SRS
+  ggstatsplot::ggcoefstats(shannon_food_srs.lm,
+  title = "Diet ~ SRS (t-score)", stats.label.color = cols_asd, exclude.intercept = T),
+  ggstatsplot::ggcoefstats(shannon_taxa_srs.lm,
+  title = "Taxa ~ SRS (t-score)", stats.label.color = cols_asd, exclude.intercept = T),
+  # X-trait PGS
+  ggstatsplot::ggcoefstats(shannon_food_pgs_xtrait.lm,
+  title = "Diet ~ ASD-ADHD-TS PGS", stats.label.color = cols_rrb, exclude.intercept = T),
+  ggstatsplot::ggcoefstats(shannon_taxa_pgs_xtrait.lm,
+  title = "Taxa ~ ASD-ADHD-TS PGS", stats.label.color = cols_rrb, exclude.intercept = T),
+  # ADOS2/G social affect
+  ggstatsplot::ggcoefstats(shannon_food_adossa.lm,
+  title = "Diet ~ ADOS2/G (social affect)", stats.label.color = cols_sa, exclude.intercept = T),
+  ggstatsplot::ggcoefstats(shannon_taxa_adossa.lm,
+  title = "Taxa ~ ADOS2/G (social affect))", stats.label.color = cols_sa, exclude.intercept = T), 
+  # # SSP
+  # ggstatsplot::ggcoefstats(shannon_food_ssp.lm,
+  # title = "Diet ~ SSP (raw sensory)", exclude.intercept = T),
+  # ggstatsplot::ggcoefstats(shannon_taxa_ssp.lm,
+  # title = "Taxa ~ SSP (raw sensory)", exclude.intercept = T),
+  # CD4 T-cell
+  ggstatsplot::ggcoefstats(shannon_food_CD4T.lm,
+  title = "Diet ~ CD4 T-cell (clr)", stats.label.color = cols_other, exclude.intercept = T),
+  ggstatsplot::ggcoefstats(shannon_taxa_CD4T.lm,
+  title = "Taxa ~ CD4 T-cell (clr)", stats.label.color = cols_other, exclude.intercept = T),
+  # Neuroticism
+  ggstatsplot::ggcoefstats(shannon_food_neuroticism.lm,
+  title = "Diet ~ Neuroticism PGS", stats.label.color = cols_other, exclude.intercept = T),
+  ggstatsplot::ggcoefstats(shannon_taxa_neuroticism.lm,
+  title = "Taxa ~ Neuroticism PGS", stats.label.color = cols_other, exclude.intercept = T))
+
+```
+
+#### Take 
+
+```{r}
+
+summary(lm(shannon ~ shannon_food, data = diversity.df))
+summary(lm(shannon ~ shannon_food, data = diversity.df %>% filter(cam_probiotic == 0)))
+summary(lm(shannon ~ shannon_food + as.factor(cam_probiotic), data = diversity.df))
+summary(lm(shannon ~ shannon_food + age + proforma_sex + participant_type + as.factor(cam_probiotic), data = diversity.df))
+
+```
+
+**Try excluding rm_rarefy (ie. those with <7M reads)**
+
+```{r}
+
+summary(lm(shannon_food ~ shannon, data = diversity.df %>% filter(!MG_SampleID %in% rm_rarefy)))
+
+```
+
+### Beta diversity - Bray-Curtis
+
+- No difference in food beta-diversity between groups
+
+#### Read in food data
+
+```{r}
+
+food <- read.delim("/PATH/TO/AES_ACRC_QTAB_diet_food_246.tsv", header = T, as.is = T)
+#food <- read.delim("/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/osca/AES_ACRC_QTAB_diet_food_246.tsv")
+food <- food[order(food$MG_SampleID),]
+diet_246 <- diet %>% filter(IID %in% food$IID)
+
+```
+
+#### Full sample
+
+- Colours on the left side demonstrate groups
+- ASD: red
+- SIB: blue
+- UNR: green
+
+```{r}
+
+braycurtis <- as.matrix(vegdist(food[,3:ncol(food)], method = "bray"))
+identical(as.character(food$MG_SampleID), diet_246$MG_SampleID)
+my_group <- as.numeric(as.factor(diet_246$participant_type))
+colSide <- brewer.pal(9, "Set1")[my_group]
+colMain <- colorRampPalette(brewer.pal(9, "Blues"))(25)
+heatmap(braycurtis, RowSideColors = colSide, col = colMain)
+
+```
+
+#### PERMANOVA test
+
+- tests whether the compositional "profile" is different
+- uses a pseudo-F-test based on the dissimilarity index (here generated using bray curtis index)
+- H0: centroids of the group are equivalent
+
+```{r}
+
+ind <- data.table(participant_type_study = diet_246$participant_type_study)
+adonis2(braycurtis ~ participant_type_study, data = ind)
+
+ind <- data.table(participant_type = diet_246$participant_type)
+adonis2(braycurtis ~ participant_type, data = ind)
+
+```
+
+#### PERMDISP2
+
+- https://forum.qiime2.org/t/adonis-betadiver-and-betadisp/9364/3
+- tests for difference in the spread/variance within a group compared to others (used to test for beta diversity)
+- eg. can test: "are the centroid differences because of inter-group variance?"
+- multivariate analogue of Levene's test for homogeneity of variance
+- non-Euclidean distances between objects and group centroids: handled by reducing original distances to PCs
+- tested ASD/SIB/UNR and ASD/SIB/UNR/UNR_QTAB
+
+```{r}
+
+braycurtis.dist <- as.dist(braycurtis)
+permdisp2 <- betadisper(braycurtis.dist, diet_246$participant_type_study)
+anova(permdisp2)
+
+braycurtis.dist <- as.dist(braycurtis)
+permdisp2 <- betadisper(braycurtis.dist, diet_246$participant_type)
+anova(permdisp2)
+
+```
+
+## Dietary PC ~ covariates + microbes
+
+### Group differences 
+
+```{r}
+
+diversity.df$group <- diversity.df$participant_type
+diversity.df$sex <- diversity.df$proforma_sex
+pc1_group <- lm(diet_PC1 ~ group + age + sex, data = diversity.df)
+pc2_group <- lm(diet_PC2 ~ group + age + sex, data = diversity.df)
+pc3_group <- lm(diet_PC3 ~ group + age + sex, data = diversity.df)
+bsc_group_agesex.lm <- lm(rBSC ~ group + age + sex, data = diversity.df)
+
+dietpc_rbsc_group_plots <- ggstatsplot::combine_plots(
+  nrow = 2, ncol = 2,
+  ggstatsplot::ggcoefstats(pc1_group, title = "dietary PC1 ~ group", exclude.intercept = TRUE, ylab = NULL, stats.label.args = list(size = 4, nudge_y = 0.3)) + theme(text = element_text(size = 15)),
+  ggstatsplot::ggcoefstats(pc2_group, title = "dietary PC2 ~ group", exclude.intercept = TRUE, ylab = NULL, stats.label.args = list(size = 4, nudge_y = 0.3)) + theme(text = element_text(size = 15)),
+  ggstatsplot::ggcoefstats(pc3_group, title = "dietary PC3 ~ group", exclude.intercept = TRUE, ylab = NULL, stats.label.args = list(size = 4, nudge_y = 0.3)) + theme(text = element_text(size = 15)),
+  ggstatsplot::ggcoefstats(bsc_group_agesex.lm,
+  title = "rBSC ~ group", exclude.intercept = TRUE, ylab = NULL, stats.label.args = list(size = 4, nudge_y = 0.3))  + theme(text = element_text(size = 15))
+)
+
+dietpc_rbsc_group_plots
+
+```
+
+### Dietary PC similarity between relatives
+
+- Motivation: how much of family status can be captured by dietary data
+- ie. Is it possible to get away without complicated models including FID, using dietary data?
+- Another question: is it possible to determine whether the similarity between relatives seen in the microbiome data (measured using Bray-Curtis here) is **due** to the dietary data (measured using Euclidean distance here)
+
+#### Qualitative similarity 
+
+##### Based on all dietary PCs
+
+```{r}
+
+pcn <- grep("PC", colnames(diet_full))
+diet_pairs <- diet_full[which(diet_full$MG_sibpair == "Y"),]
+
+euclidean_pairs <- as.matrix(vegdist(diet_pairs[,pcn], method = "euclidean"))
+colnames(euclidean_pairs) <- diet_pairs$MG_SampleID
+rownames(euclidean_pairs) <- diet_pairs$MG_SampleID
+
+my_group <- as.numeric(as.factor(diet_pairs$MG_FID))
+colSide <- rainbow_hcl(length(unique(diet_pairs$MG_FID)), c=90, l=65)[my_group]
+#colSide <- brewer.pal(length(unique(pairs$MG_FID)), "Set1")[my_group]
+colMain <- colorRampPalette(brewer.pal(9, "Blues"))(25)
+heatmap(euclidean_pairs, labRow = diet_pairs$MG_FID, labCol = diet_pairs$MG_FID, RowSideColors = colSide, col = colMain)
+
+```
+
+##### Based on top 3 dietary PCs (as these are included as covariates)
+
+- clustering still looks fairly good
+
+```{r}
+
+pcn <- c("PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe")
+diet_pairs <- diet_full[which(diet_full$MG_sibpair == "Y"),]
+
+euclidean_pairs_3pc <- as.matrix(vegdist(diet_pairs[,pcn], method = "euclidean"))
+colnames(euclidean_pairs_3pc) <- diet_pairs$MG_SampleID
+rownames(euclidean_pairs_3pc) <- diet_pairs$MG_SampleID
+
+my_group <- as.numeric(as.factor(diet_pairs$MG_FID))
+colSide <- rainbow_hcl(length(unique(diet_pairs$MG_FID)), c=90, l=65)[my_group]
+#colSide <- brewer.pal(length(unique(pairs$MG_FID)), "Set1")[my_group]
+colMain <- colorRampPalette(brewer.pal(9, "Blues"))(25)
+heatmap(euclidean_pairs_3pc, labRow = diet_pairs$MG_FID, labCol = diet_pairs$MG_FID, RowSideColors = colSide, col = colMain)
+
+```
+
+
+##### Quantify the similarity 
+
+**Compare Bray-Curtis (dissimilarity) index between ASD-SIB pairs to others**
+
+Test:
+
+- Input dataset: ASD-SIB pairs
+- For each individual:
+    - "Paired rank": ranked the Euclidean distance between the pair against all under individuals (removing the diagonal from the calculation)
+    - "Random rank": took a random Euclidean distance index --> took the rank
+- Wilcoxon rank sum test between the paired rank vs the random rank
+- Find that the ASD-SIB pairs are significantly more likely to cluster together based on dietary data
+
+###### Rank test - Using all PCs
+
+```{r}
+
+out = NULL
+rand = NULL
+full_length <- nrow(diet_pairs)-1
+for (i in 1:length(diet_pairs$MG_SampleID)) {
+  
+  # Take the index ID
+  iid <- diet_pairs$MG_SampleID[i]
+  # Take the index ID's famID
+  fid <- diet_pairs[which(diet_pairs$MG_SampleID == iid), "MG_FID"]
+  # Take the index ID's sib pair
+  fid_pair <- diet_pairs %>% filter(MG_FID == fid) %>% filter(MG_SampleID != diet_pairs$MG_SampleID[i])
+  # Find the bray-curtis index between the pair
+  ind <- euclidean_pairs[iid, fid_pair$MG_SampleID]
+  # Rank the Euclidean distance index between the pair within the other indices. Subtract 1 for the diagonal (ie. dissimilarity with oneself)
+  rank <- length(which(euclidean_pairs[iid,] < ind))-1
+  out <- c(out, rank)
+  
+  # Get a random rank to compare to as a distribution
+  rand.tmp <- sample(euclidean_pairs[-i,], 1)
+  rand_rank <- length(which(euclidean_pairs[iid,] < rand.tmp))-1
+  rand <- c(rand, rand_rank)
+  
+}
+
+# Compare
+compare_ids <- melt(data.frame(rank = out, random = rand))
+
+# Outputs
+out_ids <- data.frame(MG_SampleID = diet_pairs$MG_SampleID, MG_FID = diet_pairs$MG_FID, rank = out)
+out_ids <- out_ids[order(out_ids$MG_FID),]
+
+# Summary
+summary(out/full_length)
+wilcox.test(out, rand)
+
+# Datatable
+datatable(out_ids)
+
+# Table to include the summary statistics on the histogram
+sumstat <- ddply(compare_ids, "variable", summarise, grp.mean = mean(value), grp.median = median(value))
+
+# Histogram
+ggplot(compare_ids, aes(x=value, fill = variable)) + 
+  geom_histogram(binwidth = 2) + 
+  geom_vline(data=sumstat, aes(xintercept=grp.mean, color=variable),
+             linetype="dashed")+
+  geom_vline(data=sumstat, aes(xintercept=grp.median, color=variable),
+             linetype="solid")+
+  ggtitle("Histogram of Euclidean distance rank between ASD-SIB pairs")
+
+```
+
+###### Rank test - Using top 3 PCs
+
+```{r}
+
+out = NULL
+rand = NULL
+full_length <- nrow(diet_pairs)-1
+for (i in 1:length(diet_pairs$MG_SampleID)) {
+  
+  # Take the index ID
+  iid <- diet_pairs$MG_SampleID[i]
+  # Take the index ID's famID
+  fid <- diet_pairs[which(diet_pairs$MG_SampleID == iid), "MG_FID"]
+  # Take the index ID's sib pair
+  fid_pair <- diet_pairs %>% filter(MG_FID == fid) %>% filter(MG_SampleID != diet_pairs$MG_SampleID[i])
+  # Find the Euclidean distance between the pair
+  ind <- euclidean_pairs_3pc[iid, fid_pair$MG_SampleID]
+  # Rank the Euclidean distance index between the pair within the other indices. Subtract 1 for the diagonal (ie. dissimilarity with oneself)
+  rank <- length(which(euclidean_pairs_3pc[iid,] < ind))-1
+  out <- c(out, rank)
+  
+  # Get a random rank to compare to as a distribution
+  rand.tmp <- sample(euclidean_pairs_3pc[-i,], 1)
+  rand_rank <- length(which(euclidean_pairs_3pc[iid,] < rand.tmp))-1
+  rand <- c(rand, rand_rank)
+  
+}
+
+# Compare
+compare_ids <- melt(data.frame(rank = out, random = rand))
+
+# Outputs
+out_ids <- data.frame(MG_SampleID = diet_pairs$MG_SampleID, MG_FID = diet_pairs$MG_FID, rank = out)
+out_ids <- out_ids[order(out_ids$MG_FID),]
+
+# Summary
+summary(out/full_length)
+wilcox.test(out, rand)
+
+# Datatable
+datatable(out_ids)
+
+# Table to include the summary statistics on the histogram
+sumstat <- ddply(compare_ids, "variable", summarise, grp.mean = mean(value), grp.median = median(value))
+
+# Histogram
+ggplot(compare_ids, aes(x=value, fill = variable)) + 
+  geom_histogram(binwidth = 2) + 
+  geom_vline(data=sumstat, aes(xintercept=grp.mean, color=variable),
+             linetype="dashed")+
+  geom_vline(data=sumstat, aes(xintercept=grp.median, color=variable),
+             linetype="solid")+
+  ggtitle("Histogram of Euclidean distance rank between ASD-SIB pairs")
+
+```
+
+###### Permutation test
+
+```{rm, eval = FALSE}
+
+# Calculate "observed" Euclidean distance
+tmp <- data.table(MG_SampleID = pairs$MG_SampleID, MG_FID = pairs$MG_FID, stringsAsFactors = F)
+fid_uniq <- unique(pairs$MG_FID)
+obs = NULL
+for (i in 1:length(fid_uniq)) {
+  iids <- pairs$MG_SampleID[which(pairs$MG_FID == fid_uniq[i])]
+  obs <- c(obs, euclidean_pairs_3pc[iids[1],iids[2]])
+}
+
+# Permutations
+permut_out <- matrix(nrow = length(unique(pairs$MG_FID)), ncol = 999)
+for (n in 1:999) {
+  # 1. Randomise FIDs
+  tmp <- data.frame(MG_SampleID = pairs$MG_SampleID, FID_tmp = sample(pairs$MG_FID), stringsAsFactors = F)
+  fid_uniq <- unique(pairs$MG_FID)
+
+  # 2. For each pair, take the index ID --> calculate Bray-Curtis index with its pair
+  bc_out = NULL
+  for (i in 1:length(fid_uniq)) {
+    # Find the pairs
+    iids <- tmp$MG_SampleID[which(tmp$FID_tmp == fid_uniq[i])]
+
+    # Find the Euclidean distance between the pair
+    ind <- euclidean_pairs_3pc[iids[1],iids[2]]
+    permut_out[i,n] <- ind
+  }
+}
+
+# 3. Repeat the above 1000 times
+
+# 4. For each permutation, take the median ASD-SIB pair Bray-Curtis pair
+euclidean_permut_med <- apply(permut_out, 2, median)
+euclidean_obs_med <- median(obs)
+
+# 4. Rank the observed index vs the permutations
+rank <- length(which(euclidean_permut_med < euclidean_obs_med))+1
+print(paste("Rank of the observed ASD-SIB pair Euclidean distance vs 1000 permutations = ", rank, sep = ""))
+print(paste("p-value = ", rank/1000, sep = ""))
+
+```
+
+## Bristol Stool Chart ~ microbial features
+
+### Plot BSC and rBSC distributions
+
+```{r}
+
+diet.tmp <- diet %>% filter(!is.na(bristol_stool_chart_regroup))
+
+# Plot BSC
+g <- ggplot(diet.tmp, aes(bristol_stool_chart))
+g + geom_bar(aes(fill = participant_type), position = position_stack(reverse = TRUE)) +  theme(legend.position = "top") + scale_fill_manual(values=c("#E69F00", "#999999", "#56B4E9")) + ylim(c(0, 108))
+
+# Plot rBSC
+g <- ggplot(diet.tmp, aes(bristol_stool_chart_regroup))
+g + geom_bar(aes(fill = participant_type), position = position_stack(reverse = TRUE)) +  theme(legend.position = "top") + scale_fill_manual(values=c("#E69F00", "#999999", "#56B4E9")) + ylim(c(0, 108))
+
+```
+
+- clearer relationship with diversity than richness
+
+### Between groups
+
+```{r}
+
+bsc_group.lm <- lm(rBSC ~ group, data = diversity.df)
+bsc_group_agesex.lm <- lm(rBSC ~ group + age + sex, data = diversity.df)
+
+ggstatsplot::ggcoefstats(bsc_group.lm,
+  title = "rBSC ~ group", exclude.intercept = TRUE)
+
+ggstatsplot::ggcoefstats(bsc_group_agesex.lm,
+  title = "rBSC ~ group", exclude.intercept = TRUE)  + theme(text = element_text(size = 15))
+
+```
+
+### Diversity
+
+```{r}
+
+summarySE <- function(data=NULL, measurevar, groupvars=NULL, na.rm=FALSE,
+                      conf.interval=.95, .drop=TRUE) {
+    library(plyr)
+
+    # New version of length which can handle NA's: if na.rm==T, don't count them
+    length2 <- function (x, na.rm=FALSE) {
+        if (na.rm) sum(!is.na(x))
+        else       length(x)
+    }
+
+    # This does the summary. For each group's data frame, return a vector with
+    # N, mean, and sd
+    datac <- ddply(data, groupvars, .drop=.drop,
+      .fun = function(xx, col) {
+        c(N    = length2(xx[[col]], na.rm=na.rm),
+          mean = mean   (xx[[col]], na.rm=na.rm),
+          sd   = sd     (xx[[col]], na.rm=na.rm)
+        )
+      },
+      measurevar
+    )
+
+    # Rename the "mean" column    
+    datac <- rename(datac, c("mean" = measurevar))
+
+    datac$se <- datac$sd / sqrt(datac$N)  # Calculate standard error of the mean
+
+    # Confidence interval multiplier for standard error
+    # Calculate t-statistic for confidence interval: 
+    # e.g., if conf.interval is .95, use .975 (above/below), and use df=N-1
+    ciMult <- qt(conf.interval/2 + .5, datac$N-1)
+    datac$ci <- datac$se * ciMult
+
+    return(datac)
+}
+
+```
+
+#### Covariates: age + sex + 3 dietary PCs
+
+- chose to treat as a continuous variable (makes more sense interpretatively)
+
+```{r}
+
+# Treat as a factor
+diversity.df$bristol_stool_chart_regroup <- as.factor(diversity.df$bristol_stool_chart_regroup)
+stool.lm <- lm(shannon_residuals ~ bristol_stool_chart_regroup, data = diversity.df)
+summary(stool.lm)
+
+# Treat as a continuous variable
+diversity.df$bristol_stool_chart_regroup <- as.numeric(as.character(diversity.df$bristol_stool_chart_regroup))
+stool.lm <- lm(shannon_residuals ~ bristol_stool_chart_regroup, data = diversity.df)
+summary(stool.lm)
+
+# Dot plot
+ggplot(diversity.df, aes(x=bristol_stool_chart_regroup, y = shannon_residuals, col = participant_type)) + geom_point()
+
+# 95% CI
+diversity.df.sum <- summarySE(diversity.df, measurevar="shannon_residuals", groupvars=c("bristol_stool_chart_regroup"))
+diversity.df.sum$bristol_stool_chart_regroup <- as.factor(diversity.df.sum$bristol_stool_chart_regroup)
+ggplot(diversity.df.sum, aes(x=bristol_stool_chart_regroup, y=shannon_residuals, colour=bristol_stool_chart_regroup)) + 
+    geom_errorbar(aes(ymin=shannon_residuals-ci, ymax=shannon_residuals+ci), width=.1, position=position_dodge(0.1)) +
+    geom_point(position=position_dodge(0.1))
+
+# Compare groups
+diversity.df.box <- melt(diversity.df, id.vars = c("participant_type", "shannon_residuals"), measure.vars = c("bristol_stool_chart_regroup"))
+diversity.df.box$value <- as.factor(diversity.df.box$value)
+ggplot(diversity.df.box, aes(x=value, y=shannon_residuals, fill=participant_type)) +
+  geom_boxplot(position=position_dodge(1))
+
+```
+
+#### Covariates: age + sex + 3 dietary PCs + participant_type
+
+```{r}
+
+# Create additional residuals: shannon ~ participant_type + ...
+diversity.df$shannon_residuals_group <- lm(shannon ~ participant_type + proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diversity.df)$residuals
+
+# Treat as a continuous variable
+diversity.df$bristol_stool_chart_regroup <- as.numeric(as.character(diversity.df$bristol_stool_chart_regroup))
+stool.lm <- lm(shannon_residuals_group ~ bristol_stool_chart_regroup, data = diversity.df)
+summary(stool.lm)
+
+# Dot plot
+ggplot(diversity.df, aes(x=bristol_stool_chart_regroup, y = shannon_residuals, col = participant_type)) + geom_point()
+
+# 95% CI
+diversity.df.sum <- summarySE(diversity.df, measurevar="shannon_residuals", groupvars=c("bristol_stool_chart_regroup"))
+diversity.df.sum$bristol_stool_chart_regroup <- as.factor(diversity.df.sum$bristol_stool_chart_regroup)
+ggplot(diversity.df.sum, aes(x=bristol_stool_chart_regroup, y=shannon_residuals, colour=bristol_stool_chart_regroup)) + 
+    geom_errorbar(aes(ymin=shannon_residuals-ci, ymax=shannon_residuals+ci), width=.1, position=position_dodge(0.1)) +
+    geom_point(position=position_dodge(0.1))
+
+# Compare groups
+diversity.df.box <- melt(diversity.df, id.vars = c("participant_type", "shannon_residuals"), measure.vars = c("bristol_stool_chart_regroup"))
+diversity.df.box$value <- as.factor(diversity.df.box$value)
+ggplot(diversity.df.box, aes(x=value, y=shannon_residuals, fill=participant_type)) +
+  geom_boxplot(position=position_dodge(1))
+
+```
+
+### Richness
+
+```{r}
+
+# Treat as a factor
+richness.df$bristol_stool_chart_regroup <- as.factor(richness.df$bristol_stool_chart_regroup)
+stool.lm <- lm(richness_residuals ~ bristol_stool_chart_regroup, data = richness.df)
+summary(stool.lm)
+
+# Treat as a continuous variable
+richness.df$bristol_stool_chart_regroup <- as.numeric(as.character(richness.df$bristol_stool_chart_regroup))
+stool.lm <- lm(richness_residuals ~ bristol_stool_chart_regroup, data = richness.df)
+summary(stool.lm)
+
+# Dot plot
+ggplot(richness.df, aes(x=bristol_stool_chart_regroup, y = richness_residuals, col = participant_type)) + geom_point()
+
+# 95% CI
+richness.df.sum <- summarySE(richness.df, measurevar="richness_residuals", groupvars=c("bristol_stool_chart_regroup"))
+richness.df.sum$bristol_stool_chart_regroup <- as.factor(richness.df.sum$bristol_stool_chart_regroup)
+ggplot(richness.df.sum, aes(x=bristol_stool_chart_regroup, y=richness_residuals, colour=bristol_stool_chart_regroup)) + 
+    geom_errorbar(aes(ymin=richness_residuals-ci, ymax=richness_residuals+ci), width=.1, position=position_dodge(0.1)) +
+    geom_point(position=position_dodge(0.1))
+
+# Compare groups
+richness.df.box <- melt(richness.df, id.vars = c("participant_type", "richness_residuals"), measure.vars = c("bristol_stool_chart_regroup"))
+richness.df.box$value <- as.factor(richness.df.box$value)
+ggplot(richness.df.box, aes(x=value, y=richness_residuals, fill=participant_type)) +
+  geom_boxplot(position=position_dodge(1))
+
+```
+
+## Ordination - no covariates, ASD/SIB/UNR/UNR_QTAB
+
+### Pre-processing
+
+**Methods**
+
+- http://mixomics.org/mixmc/mixmc-pre-processing/
+- offset (add 1 to all data, but can use other methods) to handle log transformation
+- remove low counts (1% threshold)
+- clr transformation
+- for simplicity, remove the QTAB ID with no dietary data (BBC6247)
+
+```{r}
+
+rm_diet <- which(is.na(diet$PC1_diet_pe))
+data <- taxa_t[-rm_diet,2:ncol(taxa_t)]
+Y <- as.factor(diet$participant_type_study[-rm_diet])
+
+data_rm0 <- taxa_count_rm0_t[-rm_diet, 2:ncol(taxa_count_rm0_t),]
+
+data_rm0_offset_clr <- logratio.transfo(as.matrix(data_rm0), logratio = 'CLR', offset = 1)
+sum(which(data_rm0_offset_clr == 0)) # should == 0
+
+```
+
+### PCA 
+
+- Variance explained by first 2 PCs is low (10% and 6%)
+- Try stratifying by age, PC2 (as this is associated with age)
+
+```{r warning = FALSE}
+
+data_rown <- rownames(data_rm0_offset_clr)
+rownames(data_rm0_offset_clr) <- NULL
+data_rm0_offset_clr.pca <- pca(data_rm0_offset_clr, ncomp = 10)
+
+plot(data_rm0_offset_clr.pca)
+
+plotIndiv(data_rm0_offset_clr.pca, comp = c(1,2), 
+          group = Y, 
+          ind.names = TRUE,
+          legend = TRUE, title = "AAB + QTAB rm0 clr PC",
+          ellipse = TRUE, centroid = T)
+
+plotIndiv(data_rm0_offset_clr.pca, comp = c(1,2), 
+          group = round(diet$age[-rm_diet], 0), 
+          ind.names = F, pch = 1,
+          legend = TRUE, legend.title = "Age", title = "AAB + QTAB rm0 clr PC",
+          ellipse = TRUE, centroid = T)
+
+plotIndiv(data_rm0_offset_clr.pca, comp = c(1,2), 
+          group = round(diet$PC1_diet_pe[-rm_diet], 0), 
+          ind.names = TRUE,
+          legend = TRUE, legend.title = "Dietary PC1", title = "AAB + QTAB rm0 clr PC, Diet PC1",
+          ellipse = TRUE, centroid = T)
+
+plotIndiv(data_rm0_offset_clr.pca, comp = c(1,2), 
+          group = round(diet$PC2_diet_pe[-rm_diet], 0), 
+          ind.names = TRUE,
+          legend = TRUE, legend.title = "Dietary PC2", title = "AAB + QTAB rm0 clr PC, Diet PC2",
+          ellipse = TRUE, centroid = T)
+
+# return the rownames
+rownames(data_rm0_offset_clr) <- data_rown
+
+```
+
+**For comparison: a plot without the pre-processing filters (with clr transform)**
+
+```{r}
+
+taxa_count_clr_t.pca <- pca(taxa_count_clr_t[2:ncol(taxa_count_clr_t)], ncomp = 15)
+
+plot(taxa_count_clr_t.pca)
+
+plotIndiv(taxa_count_clr_t.pca, comp = c(1,2), 
+          group = as.factor(diet$participant_type_study), 
+          indiv.names = F,
+          legend = TRUE, title = "AAB + QTAB PC (NO filters)",
+          ellipse = TRUE, centroid = T)
+
+```
+
+## Ordination - no covariates, compare ASD/SIB/UNR
+
+### Pre-processing
+
+- http://mixomics.org/mixmc/mixmc-pre-processing/
+- offset (add 1 to all data, but can use other methods) to handle log transformation
+- remove low counts (1% threshold)
+- clr transformation
+- for simplicity, remove the QTAB ID with no dietary data (BBC6247)
+
+```{r}
+
+rm_diet <- which(is.na(diet$PC1_diet_pe))
+data <- taxa_t[-rm_diet,2:ncol(taxa_t)]
+Y <- as.factor(diet$participant_type[-rm_diet])
+
+data_rm0 <- taxa_count_rm0_t[-rm_diet, 2:ncol(taxa_count_rm0_t),]
+
+data_rm0_offset_clr <- logratio.transfo(as.matrix(data_rm0), logratio = 'CLR', offset = 1)
+sum(which(data_rm0_offset_clr == 0)) # should == 0
+
+```
+
+### PCA 
+
+- Variance explained by first 2 PCs is low (10% and 6%)
+- Note that Microba supervised PCA analysis on clr transformed data: PC1 = 23.68%, PC2 = 12.77%
+- Try stratifying by age, PC2 (as this is associated with age)
+
+```{r}
+
+data_rown <- rownames(data_rm0_offset_clr)
+rownames(data_rm0_offset_clr) <- NULL
+data_rm0_offset_clr.pca <- pca(data_rm0_offset_clr, ncomp = 15)
+
+plot(data_rm0_offset_clr.pca)
+
+plotIndiv(data_rm0_offset_clr.pca, comp = c(1,2), 
+          group = Y, 
+          ind.names = TRUE,
+          legend = TRUE, title = "AAB + QTAB rm0 clr PC",
+          ellipse = TRUE, centroid = T)
+
+plotIndiv(data_rm0_offset_clr.pca, comp = c(1,2), 
+          group = Y, 
+          ind.names = TRUE,
+          legend = TRUE, title = "PCA: clr-transform, rm0",
+          ellipse = TRUE, centroid = T)
+
+# return the rownames
+rownames(data_rm0_offset_clr) <- data_rown
+
+```
+
+### PLS-DA
+
+```{r}
+
+data_rm0_offset_clr.plsda <- plsda(data_rm0_offset_clr,
+                          Y = Y,
+                          ncomp = nlevels(Y),
+                          logratio = "none")
+
+data_rm0_offset_clr.perf.plsda = perf(data_rm0_offset_clr.plsda, validation = 'Mfold', folds = 5,
+                    progressBar = FALSE, nrepeat = 10)
+
+plot(data_rm0_offset_clr.perf.plsda, overlay = 'measure', sd=TRUE)
+
+```
+
+## Ordination: regress out covariates, compare ASD/SIB/UNR
+
+### Pre-processing 
+
+```{r}
+
+data_rm0 <- taxa_count_rm0_t[which(diet$PC1_diet_pe != "NA"),2:ncol(taxa_count_rm0_t)]
+Y <- as.factor(diet$participant_type[which(diet$PC1_diet_pe != "NA")])
+
+data_rm0_offset_clr <- logratio.transfo(as.matrix(data_rm0), logratio = 'CLR', offset = 1)
+sum(which(data_rm0_offset_clr == 0)) # should == 0
+
+# Create version with covariates regressed out (need to remove the IID with no dietary data)
+tmp <- colnames(diet)[grep("PC", colnames(diet))]
+cov <- diet[which(diet$PC1_diet_pe != "NA"),c("age", "proforma_sex", tmp)]
+
+# Regress out
+data_rm0_offset_clr_lm <- matrix(nrow = nrow(data_rm0_offset_clr), ncol = ncol(data_rm0_offset_clr))
+for (i in 1:ncol(data_rm0_offset_clr)) {
+  data_rm0_offset_clr_lm[,i] <- lm(data_rm0_offset_clr[,i] ~ ., data = cov)$residuals
+}
+
+colnames(data_rm0_offset_clr_lm) <- colnames(data_rm0_offset_clr)
+rownames(data_rm0_offset_clr_lm) <- rownames(data_rm0_offset_clr)
+
+```
+
+### PCA 
+
+Repeat plots with different formatting for figure
+
+```{r}
+
+data_rown <- rownames(data_rm0_offset_clr_lm)
+rownames(data_rm0_offset_clr_lm) <- NULL
+data_rm0_offset_clr_lm.pca <- pca(data_rm0_offset_clr_lm, ncomp = 15)
+
+plot(data_rm0_offset_clr_lm.pca)
+
+plotIndiv(data_rm0_offset_clr_lm.pca, comp = c(1,2), 
+          group = Y, 
+          ind.names = TRUE,
+          legend = TRUE, title = "AAB + QTAB covariates rm0 clr PC",
+          ellipse = TRUE, centroid = T)
+
+plotIndiv(data_rm0_offset_clr_lm.pca, comp = c(1,2), 
+          group = Y, 
+          ind.names = TRUE,
+          legend = TRUE, title = "PCA: clr-transform, rm0 + covariates",
+          ellipse = TRUE, centroid = T)
+
+# return the rownames
+rownames(data_rm0_offset_clr_lm) <- data_rown
+
+```
+
+## Check presence/absence metrics, Fisher's exact test
+
+- No differences between ASD/nonASD groups
+- This analysis keeps zeros
+
+### ASD vs nonASD
+
+- no differences in ASD vs non-ASD comparison at FDR threshold
+- some are at a nominal threshold
+- top is Romboutsia timonensis (p=4e-4) - most salient in the ASD vs nonASD comparison, but not passing FDR
+
+```{r}
+
+taxa_count_t.tmp <- taxa_count_t %>% filter(MG_SampleID %in% diet$MG_SampleID)
+
+diet.asd <- diet %>% filter(ASD == "ASD")
+diet.nonasd <- diet %>% filter(ASD == "nonASD")
+taxa_count_t.tmp.asd <- taxa_count_t.tmp %>% filter(MG_SampleID %in% diet.asd$MG_SampleID)
+taxa_count_t.tmp.nonasd <- taxa_count_t.tmp %>% filter(MG_SampleID %in% diet.nonasd$MG_SampleID)
+
+asd.nonzero <- colSums(taxa_count_t.tmp.asd != 0)
+nonasd.nonzero <- colSums(taxa_count_t.tmp.nonasd != 0)
+
+species.nonzero <- data.frame(Taxon = names(asd.nonzero), asd = unname(asd.nonzero), nonasd = unname(nonasd.nonzero))
+
+```
+
+```{r}
+
+# Fisher's exact test
+nasd <- 99
+nnonasd <- 149
+fisher.p <- NULL
+for (i in 1:nrow(species.nonzero)) {
+  tmp.ma <- matrix(nrow=2, ncol=2)
+  tmp.ma[1,1] <- species.nonzero$asd[i]
+  tmp.ma[1,2] <- species.nonzero$nonasd[i]
+  tmp.ma[2,1] <- nasd-species.nonzero$asd[i]
+  tmp.ma[2,2] <- nnonasd-species.nonzero$nonasd[i]
+  colnames(tmp.ma) <- c("ASD", "nonASD")
+  out.p <- fisher.test(tmp.ma)$p.value
+  fisher.p <- c(fisher.p, out.p)
+}
+
+species.nonzero <- data.frame(species.nonzero, p_Fisher = signif(fisher.p, 2), p_Fisher_FDR = signif(p.adjust(fisher.p, method = "fdr"), 2))
+
+datatable(species.nonzero)
+
+```
+
+### ASD vs SIB
+
+- no differences in ASD vs non-ASD comparison at FDR threshold
+- some are at a nominal threshold
+
+```{r}
+
+taxa_count_t.tmp <- taxa_count_t %>% filter(MG_SampleID %in% diet$MG_SampleID)
+
+diet.asd <- diet %>% filter(participant_type == "ASD" & MG_sibpair == "Y")
+diet.sib <- diet %>% filter(participant_type == "SIB" & MG_sibpair == "Y")
+taxa_count_t.tmp.asd <- taxa_count_t.tmp %>% filter(MG_SampleID %in% diet.asd$MG_SampleID)
+taxa_count_t.tmp.sib <- taxa_count_t.tmp %>% filter(MG_SampleID %in% diet.sib$MG_SampleID)
+
+asd.nonzero <- colSums(taxa_count_t.tmp.asd != 0)
+sib.nonzero <- colSums(taxa_count_t.tmp.sib != 0)
+
+species.nonzero <- data.frame(Taxon = names(asd.nonzero), asd = unname(asd.nonzero), sib = unname(sib.nonzero))
+
+```
+
+```{r}
+
+# Fisher's exact test
+nasd <- 51
+nsib <- 51
+fisher.p <- NULL
+for (i in 1:nrow(species.nonzero)) {
+  tmp.ma <- matrix(nrow=2, ncol=2)
+  tmp.ma[1,1] <- species.nonzero$asd[i]
+  tmp.ma[1,2] <- species.nonzero$sib[i]
+  tmp.ma[2,1] <- nasd-species.nonzero$asd[i]
+  tmp.ma[2,2] <- nsib-species.nonzero$sib[i]
+  colnames(tmp.ma) <- c("ASD", "SIB")
+  out.p <- fisher.test(tmp.ma)$p.value
+  fisher.p <- c(fisher.p, out.p)
+}
+
+species.nonzero <- data.frame(species.nonzero, p_Fisher = signif(fisher.p, 2), p_Fisher_FDR = signif(p.adjust(fisher.p, method = "fdr"), 2))
+
+datatable(species.nonzero)
+
+```
+
+### ASD vs UNR
+
+- no differences in ASD vs non-ASD comparison at FDR threshold
+- some are at a nominal threshold
+
+```{r}
+
+taxa_count_t.tmp <- taxa_count_t %>% filter(MG_SampleID %in% diet$MG_SampleID)
+
+diet.asd <- diet %>% filter(participant_type == "ASD")
+diet.unr <- diet %>% filter(participant_type == "UNR")
+taxa_count_t.tmp.asd <- taxa_count_t.tmp %>% filter(MG_SampleID %in% diet.asd$MG_SampleID)
+taxa_count_t.tmp.unr <- taxa_count_t.tmp %>% filter(MG_SampleID %in% diet.unr$MG_SampleID)
+
+asd.nonzero <- colSums(taxa_count_t.tmp.asd != 0)
+unr.nonzero <- colSums(taxa_count_t.tmp.unr != 0)
+
+species.nonzero <- data.frame(Taxon = names(asd.nonzero), asd = unname(asd.nonzero), unr = unname(sib.nonzero))
+
+```
+
+```{r}
+
+# Fisher's exact test
+nasd <- 99
+nunr <- 51
+fisher.p <- NULL
+for (i in 1:nrow(species.nonzero)) {
+  tmp.ma <- matrix(nrow=2, ncol=2)
+  tmp.ma[1,1] <- species.nonzero$asd[i]
+  tmp.ma[1,2] <- species.nonzero$unr[i]
+  tmp.ma[2,1] <- nasd-species.nonzero$asd[i]
+  tmp.ma[2,2] <- nsib-species.nonzero$unr[i]
+  colnames(tmp.ma) <- c("ASD", "UNR")
+  out.p <- fisher.test(tmp.ma)$p.value
+  fisher.p <- c(fisher.p, out.p)
+}
+
+species.nonzero <- data.frame(species.nonzero, p_Fisher = signif(fisher.p, 2), p_Fisher_FDR = signif(p.adjust(fisher.p, method = "fdr"), 2))
+
+datatable(species.nonzero)
+
+```
+
+## ANCOM ("Analysis of Composition of Microbiomes")
+
+- Reference: Mandal et al. 2015 https://www.tandfonline.com/doi/full/10.3402/mehd.v26.27663
+- Accounts for compositional constraints --> reduce false +ive (best out of the methods tested in Weiss et al. 2017 https://microbiomejournal.biomedcentral.com/articles/10.1186/s40168-017-0237-y)
+- Use to compare microbiome compositions in 2+ populations
+- No distributional assumptions (uses Mann-Whitney test)
+- Linear model framework
+- R implementation (usually done in QIIME/python): https://github.com/FrederickHuangLin/ANCOM/tree/master/scripts
+- Need to start with count data
+
+**Explanation of results output**
+
+- Output table provides taxa_id, W-statistic, detection at various thresholds (0.7 is commonly used, use 0.6 for more power, 0.8 and 0.9 if more stringent). 
+- Further info (direct from code):
+    - Discard taxa with "structural zeros", add pseudocount (1)
+    - For each taxon, perform additive log ratio (alr) transformation (uses taxon i as reference) --> for each pair(?) of taxa, perform regression with input formula (eg. adding covariates, linear model - in my analysis, performing Kruskal-Wallis test I think)
+    - Obtain a lower triangle matrix of p-values --> adjust to get q-value (Benjamini-Hochberg here)
+    - W-statistic: for each taxon, count the number of q-values < alpha
+    - Taxa are considered to be differentially abundant based on the W-statistic quantile. Eg. if the W-statistic > (0.9 * (n_taxa - 1)) --> considered to be differentially abundant at the 0.9 detection threshold
+    - (code comment says: "Declare a taxon to be differentially abundant based on the quantile of W statistic. We perform (n_taxa - 1) hypothesis testings on each taxon, so the maximum number of rejections is (n_taxa - 1).")
+    - "Structural zeros" are immediately called to be differentially abundant by the algorithm. eg. if a taxa is entirely absent in one group (eg. babies exposed to antibiotics vs healthy babies without any exposure). More detail on them here: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5682008/
+
+**A note on the sensitivity analyses here below**
+
+- The code for sensitivity analyses is provided here for completeness, but the code chunk is sent to eval=FALSE for speed and simplicity. The results from these sensitivity analyses are described and presented in the Supplemental Information
+
+### Prepare data
+
+```{r}
+
+# Prepare data
+metadata <- diet %>% dplyr::select(c("MG_SampleID", "ASD", "proforma_sex", "age", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "MG_FID"))
+
+metadata$ASD <- as.factor(metadata$ASD)
+metadata$MG_FID[which(metadata$MG_FID == 0)] <- metadata$MG_SampleID[which(metadata$MG_FID == 0)]
+
+ancom_taxa <- taxa_count_rm0[,c(3:ncol(taxa_count_rm0))]
+ancom_taxa <- ancom_taxa[,which(colnames(ancom_taxa) %in% metadata$MG_SampleID)]
+rownames(ancom_taxa) <- taxa_count_rm0$Taxon
+
+# Check variables in the correct order
+identical(colnames(ancom_taxa), diet$MG_SampleID)
+
+ancom_table <- feature_table_pre_process(ancom_taxa, metadata, "MG_SampleID", group_var = NULL, out_cut = 0.05, zero_cut = 1, lib_cut = 1e6, neg_lb)
+
+```
+
+**Sensitivity analysis: exclude antibiotics**
+
+```{r, eval = FALSE}
+
+# Prepare data
+metadata <- diet %>% filter(meds_antibiotic_current != 1) %>% dplyr::select(c("MG_SampleID", "ASD", "proforma_sex", "age", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "MG_FID"))
+
+metadata$ASD <- as.factor(metadata$ASD)
+metadata$MG_FID[which(metadata$MG_FID == 0)] <- NA
+
+ancom_taxa_abx <- taxa_count_rm0[,which(colnames(taxa_count_rm0) %in% metadata$MG_SampleID)]
+ancom_taxa_abx <- ancom_taxa_abx[,which(colnames(ancom_taxa_abx) %in% metadata$MG_SampleID)]
+rownames(ancom_taxa_abx) <- taxa_count_rm0$Taxon
+
+# Check variables in the correct order
+identical(colnames(ancom_taxa_abx), metadata$MG_SampleID)
+
+ancom_table_abx <- feature_table_pre_process(ancom_taxa_abx, metadata, "MG_SampleID", group_var = NULL, out_cut = 0.05, zero_cut = 1, lib_cut = 1e6, neg_lb)
+
+```
+
+**Sensitivity analysis: exclude SIB**
+
+```{r, eval = FALSE}
+
+# Prepare data
+metadata_nosib <- diet %>% dplyr::select(c("MG_SampleID", "ASD", "participant_type", "proforma_sex", "age", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "MG_FID")) %>% filter(participant_type != "SIB")
+
+metadata_nosib$ASD <- as.factor(metadata_nosib$ASD)
+metadata_nosib$MG_FID[which(metadata_nosib$MG_FID == 0)] <- metadata_nosib$MG_SampleID[which(metadata_nosib$MG_FID == 0)]
+
+ancom_taxa <- taxa_count_rm0[,c(3:ncol(taxa_count_rm0))]
+ancom_taxa <- ancom_taxa[,which(colnames(ancom_taxa) %in% metadata_nosib$MG_SampleID)]
+rownames(ancom_taxa) <- taxa_count_rm0$Taxon
+
+# Check variables in the correct order
+identical(colnames(ancom_taxa), metadata_nosib$MG_SampleID)
+
+ancom_table_nosib <- feature_table_pre_process(ancom_taxa, metadata_nosib, "MG_SampleID", group_var = NULL, out_cut = 0.05, zero_cut = 1, lib_cut = 1e6, neg_lb)
+
+```
+
+**Sensitivity analysis: age <= 10, no QTAB (n=136)**
+
+```{r, eval = FALSE}
+
+# Prepare data
+metadata_ageu10noqtab <- diet %>% filter(participant_type_study != "UNR_QTAB") %>% filter(age <= 10)  %>% dplyr::select(c("MG_SampleID", "ASD", "participant_type", "proforma_sex", "age", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "MG_FID"))
+
+metadata_ageu10noqtab$ASD <- as.factor(metadata_ageu10noqtab$ASD)
+metadata_ageu10noqtab$MG_FID[which(metadata_ageu10noqtab$MG_FID == 0)] <- metadata_ageu10noqtab$MG_SampleID[which(metadata_ageu10noqtab$MG_FID == 0)]
+
+ancom_taxa <- taxa_count_rm0[,c(3:ncol(taxa_count_rm0))]
+ancom_taxa <- ancom_taxa[,which(colnames(ancom_taxa) %in% metadata_ageu10noqtab$MG_SampleID)]
+rownames(ancom_taxa) <- taxa_count_rm0$Taxon
+
+# Check variables in the correct order
+identical(colnames(ancom_taxa), metadata_ageu10noqtab$MG_SampleID)
+
+ancom_table_ageu10noqtab <- feature_table_pre_process(ancom_taxa, metadata_ageu10noqtab, "MG_SampleID", group_var = NULL, out_cut = 0.05, zero_cut = 1, lib_cut = 1e6, neg_lb)
+
+```
+
+**Sensitivity analysis: sibling pairs only**
+
+```{r, eval = FALSE}
+
+# Prepare data
+metadata_pairs <- diet %>% filter(MG_FID != 0) %>% dplyr::select(c("MG_SampleID", "ASD", "participant_type", "proforma_sex", "age", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "MG_FID"))
+
+metadata_pairs$ASD <- as.factor(metadata_pairs$ASD)
+metadata_pairs$MG_FID[which(metadata_pairs$MG_FID == 0)] <- metadata_pairs$MG_SampleID[which(metadata_pairs$MG_FID == 0)]
+
+ancom_taxa <- taxa_count_rm0[,c(3:ncol(taxa_count_rm0))]
+ancom_taxa <- ancom_taxa[,which(colnames(ancom_taxa) %in% metadata_pairs$MG_SampleID)]
+rownames(ancom_taxa) <- taxa_count_rm0$Taxon
+
+# Check variables in the correct order
+identical(colnames(ancom_taxa), metadata_pairs$MG_SampleID)
+
+ancom_table_pairs <- feature_table_pre_process(ancom_taxa, metadata_pairs, "MG_SampleID", group_var = NULL, out_cut = 0.05, zero_cut = 1, lib_cut = 1e6, neg_lb)
+
+```
+
+**Remove individuals with <7M reads (n=229)**
+
+```{r, eval = FALSE}
+
+# Prepare data
+metadata <- diet %>% filter(!MG_SampleID %in% rm_rarefy) %>% dplyr::select(c("MG_SampleID", "ASD", "proforma_sex", "age", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "MG_FID"))
+
+metadata$ASD <- as.factor(metadata$ASD)
+metadata$MG_FID[which(metadata$MG_FID == 0)] <- metadata$MG_SampleID[which(metadata$MG_FID == 0)]
+
+ancom_taxa <- taxa_count_rm0[,c(3:ncol(taxa_count_rm0))]
+ancom_taxa <- ancom_taxa[,which(colnames(ancom_taxa) %in% metadata$MG_SampleID)]
+rownames(ancom_taxa) <- taxa_count_rm0$Taxon
+
+# Check variables in the correct order
+identical(colnames(ancom_taxa), metadata$MG_SampleID)
+
+ancom_table_rarefy7M <- feature_table_pre_process(ancom_taxa, metadata, "MG_SampleID", group_var = NULL, out_cut = 0.05, zero_cut = 1, lib_cut = 1e6, neg_lb)
+
+```
+
+```{r, eval = FALSE}
+
+# Prepare data
+metadata <- diet %>% dplyr::select(c("MG_SampleID", "participant_type", "proforma_sex", "age", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "MG_FID"))
+
+metadata$participant_type <- as.factor(metadata$participant_type)
+
+ancom_taxa <- taxa_count_rm0[,c(3:ncol(taxa_count_rm0))]
+ancom_taxa <- ancom_taxa[,which(colnames(ancom_taxa) %in% metadata$MG_SampleID)]
+rownames(ancom_taxa) <- taxa_count_rm0$Taxon
+
+# Check variables in the correct order
+identical(colnames(ancom_taxa), metadata$MG_SampleID)
+
+ancom_table <- feature_table_pre_process(ancom_taxa, metadata, "MG_SampleID", group_var = NULL, out_cut = 0.05, zero_cut = 0.90, lib_cut = 1e6, neg_lb)
+
+```
+
+### Covariates: no covariates
+
+#### Case-control analysis
+
+```{r, eval = FALSE}
+
+# Run tests with covariates
+ancom_out <- ANCOM(ancom_table$feature_table, ancom_table$meta_data, ancom_table$structure_zeros, main_var = "ASD", p_adj_method = "BH")
+
+ancom_out$out <- ancom_out$out[order(ancom_out$out$W, decreasing = T),]
+
+datatable(ancom_out$out)
+
+ancom_out$fig
+
+```
+
+**Sensitivity analysis: age<=10, no QTAB (n=136)**
+
+```{r, eval = FALSE}
+
+# Run tests with covariates
+ancom_out <- ANCOM(ancom_table_ageu10noqtab$feature_table, ancom_table_ageu10noqtab$meta_data, ancom_table_ageu10noqtab$structure_zeros, main_var = "ASD", p_adj_method = "BH")
+
+ancom_out$out <- ancom_out$out[order(ancom_out$out$W, decreasing = T),]
+
+datatable(ancom_out$out)
+
+ancom_out$fig
+
+```
+
+**Sensitivity analysis: sibling pairs only**
+
+```{r, eval = FALSE}
+
+# Run tests with covariates
+ancom_out <- ANCOM(ancom_table_pairs$feature_table, ancom_table_pairs$meta_data, ancom_table_pairs$structure_zeros, main_var = "ASD", p_adj_method = "BH")
+
+ancom_out$out <- ancom_out$out[order(ancom_out$out$W, decreasing = T),]
+
+datatable(ancom_out$out)
+
+ancom_out$fig
+
+```
+
+**Sensitivity analysis: sibling pairs only with 1|FID random effect**
+
+```{r, eval = FALSE}
+
+# Run tests with covariates
+ancom_out <- ANCOM(ancom_table_pairs$feature_table, ancom_table_pairs$meta_data, ancom_table_pairs$structure_zeros, main_var = "ASD", rand_formula = "~ 1|MG_FID", p_adj_method = "BH")
+
+ancom_out$out <- ancom_out$out[order(ancom_out$out$W, decreasing = T),]
+
+datatable(ancom_out$out)
+
+ancom_out$fig
+
+```
+
+
+### Covariates: sex + age
+
+#### Case-control analysis
+
+```{r, eval = FALSE}
+
+# Run tests with covariates
+ancom_out_sex_age <- ANCOM(ancom_table$feature_table, ancom_table$meta_data, ancom_table$structure_zeros, main_var = "ASD", p_adj_method = "BH", adj_formula = "proforma_sex + age")
+
+ancom_out_sex_age$out <- ancom_out_sex_age$out[order(ancom_out_sex_age$out$W, decreasing = T),]
+
+datatable(ancom_out_sex_age$out)
+
+ancom_out_sex_age$fig
+
+```
+
+#### Group analysis
+
+```{r, eval = FALSE}
+
+# Run tests with covariates
+ancom_out_sex_age <- ANCOM(ancom_table$feature_table, ancom_table$meta_data, ancom_table$structure_zeros, main_var = "participant_type", p_adj_method = "BH", adj_formula = "proforma_sex + age")
+
+ancom_out_sex_age$out <- ancom_out_sex_age$out[order(ancom_out_sex_age$out$W, decreasing = T),]
+
+datatable(ancom_out_sex_age$out)
+
+ancom_out_sex_age$fig
+
+```
+
+### Covariates: sex + age + dietary PCs
+
+- (as above)
+- suggests that diet doesn't have much of an effect
+
+#### Case-control analysis
+
+```{r}
+
+# Run tests with covariates (age + sex + diet)
+ancom_out_sex_age_diet <- ANCOM(ancom_table$feature_table, ancom_table$meta_data, ancom_table$structure_zeros, main_var = "ASD", p_adj_method = "BH", adj_formula = "proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe")
+
+ancom_out_sex_age_diet$out <- ancom_out_sex_age_diet$out[order(ancom_out_sex_age_diet$out$W, decreasing = T),]
+
+datatable(ancom_out_sex_age_diet$out)
+
+ancom_out_sex_age_diet$fig
+
+```
+
+**Sensitivity analysis: exclude antibiotics**
+
+```{r, eval = FALSE}
+
+# Run tests with covariates (age + sex + diet)
+ancom_out_sex_age_diet <- ANCOM(ancom_table_abx$feature_table, ancom_table_abx$meta_data, ancom_table_abx$structure_zeros, main_var = "ASD", p_adj_method = "BH", adj_formula = "proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe")
+
+ancom_out_sex_age_diet$out <- ancom_out_sex_age_diet$out[order(ancom_out_sex_age_diet$out$W, decreasing = T),]
+
+datatable(ancom_out_sex_age_diet$out)
+
+ancom_out_sex_age_diet$fig
+
+```
+
+**Sensitivity analysis: exclude SIB**
+
+```{r, eval = FALSE}
+
+# Run tests with covariates (age + sex + diet)
+ancom_out_sex_age_diet <- ANCOM(ancom_table_nosib$feature_table, ancom_table_nosib$meta_data, ancom_table_nosib$structure_zeros, main_var = "ASD", p_adj_method = "BH", adj_formula = "proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe")
+
+ancom_out_sex_age_diet$out <- ancom_out_sex_age_diet$out[order(ancom_out_sex_age_diet$out$W, decreasing = T),]
+
+datatable(ancom_out_sex_age_diet$out)
+
+ancom_out_sex_age_diet$fig
+
+```
+
+**Sensitivity analysis: age<=10, no QTAB (n=136)**
+
+```{r, eval = FALSE}
+
+# Run tests with covariates (age + sex + diet)
+ancom_out_sex_age_diet <- ANCOM(ancom_table_ageu10noqtab$feature_table, ancom_table_ageu10noqtab$meta_data, ancom_table_ageu10noqtab$structure_zeros, main_var = "ASD", p_adj_method = "BH", adj_formula = "proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe")
+
+ancom_out_sex_age_diet$out <- ancom_out_sex_age_diet$out[order(ancom_out_sex_age_diet$out$W, decreasing = T),]
+
+datatable(ancom_out_sex_age_diet$out)
+
+ancom_out_sex_age_diet$fig
+
+```
+
+**Sensitivity analysis: sibling pairs only**
+
+```{r, eval = FALSE}
+
+# Run tests with covariates (age + sex + diet)
+ancom_out_sex_age_diet <- ANCOM(ancom_table_pairs$feature_table, ancom_table_pairs$meta_data, ancom_table_pairs$structure_zeros, main_var = "ASD", p_adj_method = "BH", adj_formula = "proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe")
+
+ancom_out_sex_age_diet$out <- ancom_out_sex_age_diet$out[order(ancom_out_sex_age_diet$out$W, decreasing = T),]
+
+datatable(ancom_out_sex_age_diet$out)
+
+ancom_out_sex_age_diet$fig
+
+```
+
+**Sensitivity analysis: individuals with 7M reads (n=229)**
+
+```{r, eval = FALSE}
+
+# Run tests with covariates (age + sex + diet)
+ancom_out_sex_age_diet <- ANCOM(ancom_table_rarefy7M$feature_table, ancom_table_rarefy7M$meta_data, ancom_table_rarefy7M$structure_zeros, main_var = "ASD", p_adj_method = "BH", adj_formula = "proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe")
+
+ancom_out_sex_age_diet$out <- ancom_out_sex_age_diet$out[order(ancom_out_sex_age_diet$out$W, decreasing = T),]
+
+datatable(ancom_out_sex_age_diet$out)
+
+ancom_out_sex_age_diet$fig
+
+```
+
+#### Group analysis
+
+```{r, eval = FALSE}
+
+# Run tests with covariates (age + sex + diet)
+ancom_out_sex_age_diet <- ANCOM(ancom_table$feature_table, ancom_table$meta_data, ancom_table$structure_zeros, main_var = "participant_type", p_adj_method = "BH", adj_formula = "proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe")
+
+ancom_out_sex_age_diet$out <- ancom_out_sex_age_diet$out[order(ancom_out_sex_age_diet$out$W, decreasing = T),]
+
+datatable(ancom_out_sex_age_diet$out)
+
+ancom_out_sex_age_diet$fig
+
+```
+
+## ANCOM for DQ/IQ
+
+### Prepare data
+
+```{r}
+
+# Prepare data
+metadata <- diet %>% dplyr::select(c("MG_SampleID", "devq_wisc_msel_nih", "proforma_sex", "age", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "MG_FID"))
+
+#metadata$ASD <- as.factor(metadata$ASD)
+metadata$MG_FID[which(metadata$MG_FID == 0)] <- metadata$MG_SampleID[which(metadata$MG_FID == 0)]
+
+ancom_taxa <- taxa_count_rm0[,c(3:ncol(taxa_count_rm0))]
+ancom_taxa <- ancom_taxa[,which(colnames(ancom_taxa) %in% metadata$MG_SampleID)]
+rownames(ancom_taxa) <- taxa_count_rm0$Taxon
+
+# Check variables in the correct order
+identical(colnames(ancom_taxa), diet$MG_SampleID)
+
+ancom_table <- feature_table_pre_process(ancom_taxa, metadata, "MG_SampleID", group_var = NULL, out_cut = 0.05, zero_cut = 1, lib_cut = 1e6, neg_lb)
+
+```
+
+**Sensitivity analysis: remove SIB**
+
+```{r, eval = FALSE}
+
+# Prepare data
+metadata_nosib <- diet %>% dplyr::select(c("MG_SampleID", "participant_type", "devq_wisc_msel_nih", "proforma_sex", "age", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "MG_FID")) %>% filter(participant_type != "SIB")
+
+#metadata$ASD <- as.factor(metadata$ASD)
+metadata_nosib$MG_FID[which(metadata_nosib$MG_FID == 0)] <- metadata_nosib$MG_SampleID[which(metadata_nosib$MG_FID == 0)]
+
+ancom_taxa <- taxa_count_rm0[,c(3:ncol(taxa_count_rm0))]
+ancom_taxa <- ancom_taxa[,which(colnames(ancom_taxa) %in% metadata_nosib$MG_SampleID)]
+rownames(ancom_taxa) <- taxa_count_rm0$Taxon
+
+# Check variables in the correct order
+identical(colnames(ancom_taxa), metadata_nosib$MG_SampleID)
+
+ancom_table_nosib <- feature_table_pre_process(ancom_taxa, metadata_nosib, "MG_SampleID", group_var = NULL, out_cut = 0.05, zero_cut = 1, lib_cut = 1e6, neg_lb)
+
+```
+
+### Covariates: sex + age + dietary PCs
+
+#### Case-control analysis
+
+```{r}
+
+# Run tests with covariates (age + sex + diet)
+ancom_out_sex_age_diet <- ANCOM(ancom_table$feature_table, ancom_table$meta_data, ancom_table$structure_zeros, main_var = "devq_wisc_msel_nih", p_adj_method = "BH", adj_formula = "proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe")
+
+ancom_out_sex_age_diet$out <- ancom_out_sex_age_diet$out[order(ancom_out_sex_age_diet$out$W, decreasing = T),]
+
+datatable(ancom_out_sex_age_diet$out)
+
+ancom_out_sex_age_diet$fig
+
+```
+
+**Sensitivity analysis: exclude SIB**
+
+```{r, eval = FALSE}
+
+# Run tests with covariates (age + sex + diet)
+ancom_out_sex_age_diet <- ANCOM(ancom_table_nosib$feature_table, ancom_table_nosib$meta_data, ancom_table_nosib$structure_zeros, main_var = "devq_wisc_msel_nih", p_adj_method = "BH", adj_formula = "proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe")
+
+ancom_out_sex_age_diet$out <- ancom_out_sex_age_diet$out[order(ancom_out_sex_age_diet$out$W, decreasing = T),]
+
+datatable(ancom_out_sex_age_diet$out)
+
+ancom_out_sex_age_diet$fig
+
+```
+
+## Romboutsia timonensis
+
+```{r}
+
+# Extract data
+rt <- taxa_count_rm0[grep("Romboutsia", taxa_count_rm0$Taxon),3:ncol(taxa_count_rm0)]
+rt <- rt[,order(colnames(rt))]
+rt_clr <- taxa_count_rm0_clr[grep("Romboutsia", taxa_count_rm0_clr$Taxon),3:ncol(taxa_count_rm0_clr)]
+diet_rt <- diet[order(diet$MG_SampleID),]
+
+identical(colnames(rt), diet$MG_SampleID)
+
+# Create dataframe
+rt.df <- data.frame(MG_SampleID = colnames(rt), abundance = t(rt[1,]), abundance_clr = t(rt_clr[1,]), participant_type = diet_rt$participant_type)
+colnames(rt.df) <- c("MG_SampleID", "abundance", "clr", "participant_type")
+
+# Density plot of Romboutsia timonensis, separated by group
+count_v.gg <- ggplot(rt.df, aes(x=abundance, y=participant_type, fill=participant_type)) + 
+  geom_violin() + geom_boxplot(width=0.1) + theme(legend.position = "none")
+count.gg <- ggplot(rt.df, aes(x=abundance, fill=participant_type)) + 
+  geom_histogram(position = "dodge") + theme(legend.position = "none")
+clr.gg <- ggplot(rt.df, aes(x=clr, fill=participant_type)) + 
+  geom_histogram(position = "dodge") + theme(legend.position = "none")
+
+# Panel plot
+library(ggpubr)
+rt.gg <- ggarrange(count_v.gg, count.gg, clr.gg,
+          labels = c("a", "b", "c"),
+          ncol = 1, nrow = 3)
+rt.gg
+
+```
+
+
+## Split test/train (4:1 ratio)
+
+**ASD/nonASD analysis**
+
+```{r}
+
+# Set random seed to make results reproducible:
+set.seed(1234)
+# - take random sample of ASD
+tmp.asd <- taxa_count_rm0_clr_t_asd %>% filter(ASD == "ASD")
+train_asd.ind.tmp <- sample(1:nrow(tmp.asd), size = floor(nrow(tmp.asd)/5)*4)
+train_asd <- tmp.asd$MG_SampleID[train_asd.ind.tmp]
+train_asd.ind <- which(taxa_count_rm0_clr_t_asd$MG_SampleID %in% train_asd)
+# - take random sample of nonASD
+tmp.nasd <- taxa_count_rm0_clr_t_asd %>% filter(ASD == "nonASD")
+train_nasd.ind.tmp <- sample(1:nrow(tmp.nasd), size = floor(nrow(tmp.nasd)/5)*4)
+train_nasd <- tmp.nasd$MG_SampleID[train_nasd.ind.tmp]
+train_nasd.ind <- which(taxa_count_rm0_clr_t_asd$MG_SampleID %in% train_nasd)
+
+# Separate test/train
+training_asd <- taxa_count_rm0_clr_t_asd[c(train_asd.ind, train_nasd.ind),]
+test_asd <- taxa_count_rm0_clr_t_asd[-c(train_asd.ind, train_nasd.ind),]
+
+```
+
+**age analysis**
+
+```{r}
+
+# Set random seed to make results reproducible:
+set.seed(1234)
+# - take random sample of all
+train.ind <- sample(1:nrow(taxa_count_rm0_clr_t_age), size = floor(nrow(taxa_count_rm0_clr_t_asd)/5)*4)
+
+# Separate test/train
+training_age <- taxa_count_rm0_clr_t_age[train.ind,]
+test_age <- taxa_count_rm0_clr_t_age[-train.ind,]
+
+```
+
+## AdaBoost
+
+```{r}
+
+# ASD
+maxdepth <- 10
+x <- as.matrix(training_asd[,3:ncol(training_asd)])
+y <- ifelse(training_asd$ASD == "ASD", 1, -1)
+y_test <- ifelse(test_asd$ASD == "ASD", 1, -1)
+
+boost <- adaboost(x, y, tree_depth = maxdepth, n_rounds = 100)
+pred <- predict(boost, test_asd[,3:ncol(test_asd)])
+eval_model(pred, y_test)
+
+# AGE (classify <= 10 versus >10, works out to be 137 vs 109)
+maxdepth <- 10
+x <- as.matrix(training_age[,3:ncol(training_age)])
+y <- ifelse(training_age$age <= 10, 1, -1)
+y_test <- ifelse(test_age$age <= 10, 1, -1)
+
+boost <- adaboost(x, y, tree_depth = maxdepth, n_rounds = 100)
+pred <- predict(boost, test_age[,3:ncol(test_age)])
+eval_model(pred, y_test)
+
+```
+
+### 1000 iterations
+
+#### ASD
+
+**Start with ASD/UNR comparison only to avoid sibling pair issues with sampling**
+
+```{r}
+
+# ASD
+# Munge data to have the phenotype as column 1 followed by bacteria
+diet_full.tmp <- diet_full %>% filter(!participant_type == "SIB") %>% dplyr::select(c("MG_SampleID", "ASD"))
+taxa_count_rm0_clr_t_asd <- data.frame(MG_SampleID = rownames(taxa_count_rm0_clr_t), taxa_count_rm0_clr_t[,3:ncol(taxa_count_rm0_clr_t)])
+taxa_count_rm0_clr_t_asd <- join(diet_full.tmp, taxa_count_rm0_clr_t_asd, by = "MG_SampleID", type = "inner")
+
+# Finalise the input dataset
+taxa_count_rm0_clr_t_asd_in <- taxa_count_rm0_clr_t_asd[,3:ncol(taxa_count_rm0_clr_t_asd)]
+
+table(taxa_count_rm0_clr_t_asd$ASD)
+
+# Make train/test sets
+niter <- 1000
+training_asd.ls <- list()
+test_asd.ls <- list()
+
+for (i in 1:niter) {
+  # Set random seed to make results reproducible:
+  #set.seed(1234)
+  # - take random sample of ASD
+  tmp.asd <- taxa_count_rm0_clr_t_asd %>% filter(ASD == "ASD")
+  train_asd.ind.tmp <- sample(1:nrow(tmp.asd), size = floor(nrow(tmp.asd)/5)*4)
+  train_asd <- tmp.asd$MG_SampleID[train_asd.ind.tmp]
+  train_asd.ind <- which(taxa_count_rm0_clr_t_asd$MG_SampleID %in% train_asd)
+  # - take random sample of nonASD
+  tmp.nasd <- taxa_count_rm0_clr_t_asd %>% filter(ASD == "nonASD")
+  train_nasd.ind.tmp <- sample(1:nrow(tmp.nasd), size = floor(nrow(tmp.nasd)/5)*4)
+  train_nasd <- tmp.nasd$MG_SampleID[train_nasd.ind.tmp]
+  train_nasd.ind <- which(taxa_count_rm0_clr_t_asd$MG_SampleID %in% train_nasd)
+
+  # Separate test/train
+  training_asd.ls[[i]] <- taxa_count_rm0_clr_t_asd[c(train_asd.ind, train_nasd.ind),]
+  test_asd.ls[[i]] <- taxa_count_rm0_clr_t_asd[-c(train_asd.ind, train_nasd.ind),]
+}
+
+# Run adaboost
+# ASD
+adaboost_run <- function(x) {
+  maxdepth <- 10
+  training_asd <- training_asd.ls[[x]]
+  test_asd <- test_asd.ls[[x]]
+  
+  x <- as.matrix(training_asd[,3:ncol(training_asd)])
+  y <- ifelse(training_asd$ASD == "ASD", 1, -1)
+  y_test <- ifelse(test_asd$ASD == "ASD", 1, -1)
+  
+  boost <- adaboost(x, y, tree_depth = maxdepth, n_rounds = 100)
+  pred <- predict(boost, test_asd[,3:ncol(test_asd)])
+  #eval_model(pred, y_test)
+  return(data.frame(pred, y_test))
+}
+
+adaboost_1000 <- lapply(1:niter, adaboost_run)
+
+adaboost_1000_accuracy <- unlist(lapply(adaboost_1000, function(x) (length(which(x[,1] == x[,2]))/nrow(x))))
+
+hist(adaboost_1000_accuracy, main = "adaboost accuracy (n=1000): ASD")
+
+```
+
+#### Age
+
+**Start with ASD/UNR comparison only to avoid sibling pair issues with sampling**
+
+```{r}
+
+# AGE
+# Munge data to have the phenotype as column 1 followed by bacteria
+diet_full.tmp <- diet_full %>% filter(!participant_type == "SIB") %>% dplyr::select(c("MG_SampleID", "age"))
+taxa_count_rm0_clr_t_age <- data.frame(MG_SampleID = rownames(taxa_count_rm0_clr_t), taxa_count_rm0_clr_t[,2:ncol(taxa_count_rm0_clr_t)])
+taxa_count_rm0_clr_t_age <- join(diet_full.tmp, taxa_count_rm0_clr_t_age, by = "MG_SampleID", type = "inner")
+
+# Finalise the input dataset
+taxa_count_rm0_clr_t_age_in <- taxa_count_rm0_clr_t_age[,3:ncol(taxa_count_rm0_clr_t_age)]
+
+# Make train/test sets
+niter <- 1000
+training_age.ls <- list()
+test_age.ls <- list()
+
+for (i in 1:niter) {
+  # Set random seed to make results reproducible:
+  #set.seed(1234)
+  # - take random sample of all
+  train.ind <- sample(1:nrow(taxa_count_rm0_clr_t_age), size = floor(nrow(taxa_count_rm0_clr_t_age)/5)*4)
+  
+  # Separate test/train
+  training_age.ls[[i]] <- taxa_count_rm0_clr_t_age[train.ind,]
+  test_age.ls[[i]] <- taxa_count_rm0_clr_t_age[-train.ind,]
+}
+
+# Run adaboost
+# Age
+adaboost_run_age <- function(x) {
+  maxdepth <- 10
+  training_age <- training_age.ls[[x]]
+  test_age <- test_age.ls[[x]]
+  
+  x <- as.matrix(training_age[,3:ncol(training_age)])
+  y <- ifelse(training_age$age <= 10, 1, -1)
+  y_test <- ifelse(test_age$age <= 10, 1, -1)
+  
+  boost <- adaboost(x, y, tree_depth = maxdepth, n_rounds = 100)
+  pred <- predict(boost, test_age[,3:ncol(test_age)])
+  #eval_model(pred, y_test)
+  return(data.frame(pred, y_test))
+}
+
+adaboost_1000_age <- lapply(1:niter, adaboost_run_age)
+
+adaboost_1000_age_accuracy <- unlist(lapply(adaboost_1000_age, function(x) (length(which(x[,1] == x[,2]))/nrow(x))))
+
+hist(adaboost_1000_age_accuracy, main = "adaboost accuracy (n=1000): age")
+
+```
+
+
+## Random forest (for prediction)
+
+- use taxa_count_rm0_clr
+
+```{r}
+
+# Perform training:
+rf_classifier <- randomForest(ASD ~ ., data=training, ntree=100, mtry=2, importance=TRUE)
+
+```
