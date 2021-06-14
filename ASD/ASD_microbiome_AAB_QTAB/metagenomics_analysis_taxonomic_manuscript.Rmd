@@ -34,8 +34,6 @@ output:
 - Removed taxa with <10 non-zero values (referred below here as "remove 0s") for some analyses 
     - Analyses with removal:
         - Bray-Curtis index + PERMANOVA + PERMDISP2
-        - sPLS-DA (+ also apply offset = 1)
-        - Linear models: ANOVA/mixed linear model (to include family pair information)/partially-overlapping t-tests on clr-transformed data
         - ANCOM
     - Analysis without removal: 
         - richness, Shannon index
@@ -674,19 +672,11 @@ summary(aov(shannon ~ as.factor(cam_probiotic) + age + proforma_sex + PC1_diet_p
 
 # Effect of removing QTAB
 diversity_u10.df <- diversity.df %>% filter(age <= 10) %>% filter(participant_type_study != "UNR_QTAB")
-#summary(lm(shannon ~ participant_type_study, data = diversity_u10.df))
-#summary(lm(shannon ~ participant_type_study + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diversity_u10.df))
 oneway.test(shannon ~ participant_type, data = diversity_u10.df)
 oneway.test(shannon_residuals ~ participant_type, diversity_u10.df)
 
 # Effect of removing those with <7M reads
 diversity_rarefy.df <- diversity.df %>% filter(!MG_SampleID %in% rm_rarefy)
-#summary(lm(shannon ~ participant_type, data = diversity_rarefy.df))
-#anova(lm(shannon ~ participant_type, data = diversity_rarefy.df))
-#summary(lm(shannon ~ participant_type + age + proforma_sex, data = diversity_rarefy.df))
-#anova(lm(shannon ~ participant_type + age + proforma_sex, data = diversity_rarefy.df))
-#summary(lm(shannon ~ participant_type + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diversity_rarefy.df))
-#anova(lm(shannon ~ participant_type + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diversity_rarefy.df))
 oneway.test(shannon ~ participant_type, data = diversity.df %>% filter(!MG_SampleID %in% rm_rarefy))
 oneway.test(shannon_residuals ~ participant_type, data = diversity.df %>% filter(!MG_SampleID %in% rm_rarefy))
 
@@ -697,12 +687,6 @@ oneway.test(shannon_residuals ~ participant_type, data = diversity_pairs.df)
 # - random effect
 summary(aov(shannon ~ participant_type + Error(MG_FID), data = diversity_pairs.df))
 summary(aov(shannon_residuals ~ participant_type + Error(MG_FID), data = diversity_pairs.df))
-#summary(lm(shannon ~ participant_type, data = diversity_pairs.df))
-#anova(lm(shannon ~ participant_type, data = diversity_pairs.df))
-#summary(lm(shannon ~ participant_type + age + proforma_sex, data = diversity_pairs.df))
-#anova(lm(shannon ~ participant_type + age + proforma_sex, data = diversity_pairs.df))
-#summary(lm(shannon ~ participant_type + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diversity_pairs.df))
-#anova(lm(shannon ~ participant_type + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diversity_pairs.df))
 summary(aov(shannon ~ participant_type + age + proforma_sex + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe + Error(MG_FID), data = diversity_pairs.df))
 
 ```
@@ -1293,7 +1277,7 @@ ggplot(compare_ids, aes(x=value, fill = variable)) +
 
 ```
 
-## Shannon food
+## Dietary diversity: linear models
 
 ### Compare groups
 
@@ -3157,22 +3141,6 @@ plotIndiv(data_rm0_offset_clr.pca, comp = c(1,2),
 
 # return the rownames
 rownames(data_rm0_offset_clr) <- data_rown
-
-```
-
-### PLS-DA
-
-```{r}
-
-data_rm0_offset_clr.plsda <- plsda(data_rm0_offset_clr,
-                          Y = Y,
-                          ncomp = nlevels(Y),
-                          logratio = "none")
-
-data_rm0_offset_clr.perf.plsda = perf(data_rm0_offset_clr.plsda, validation = 'Mfold', folds = 5,
-                    progressBar = FALSE, nrepeat = 10)
-
-plot(data_rm0_offset_clr.perf.plsda, overlay = 'measure', sd=TRUE)
 
 ```
 
