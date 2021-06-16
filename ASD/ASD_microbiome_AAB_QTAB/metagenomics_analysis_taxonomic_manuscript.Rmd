@@ -126,31 +126,14 @@ library(OneR) # for eval_model() function
 
 <br><br><br><br>
 
-```{r, include = FALSE}
-
-#taxa_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_relativeabundance.tsv"
-taxa_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_relativeabundance_MGDBv2ext.tsv"
-#taxa_count_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_counts.tsv"
-taxa_count_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_counts_MGDBv2ext.tsv"
-func_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/functional_profiles/by_sample/MICROBA.samples.tsv"
-diet_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/Diet/AES_ACRC_QTAB/AES_ACRC_QTAB_diet_PC_Microba_248_pcenergy_PC13_clr.csv"
-pheno_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/Phenotype/extracted_pheno/cognitive_crossancestry_child.pheno"
-sample_qc_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/metrics.tsv"
-# sample_qc_dir <- "/Users/uqcyap3/Documents/Research/ASD/3_metagenomics/Microba_QC/Sample_QC.csv"
-
-```
-
 ```{r, eval = FALSE}
 
-#taxa_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_relativeabundance.tsv"
 taxa_dir <- "/PATH/TO/taxonomic_profiles/profiles_relativeabundance_MGDBv2ext.tsv"
-#taxa_count_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_counts.tsv"
 taxa_count_dir <- "/PATH/TO/taxonomic_profiles/profiles_counts_MGDBv2ext.tsv"
 func_dir <- "/PATH/TO/functional_profiles/by_sample/MICROBA.samples.tsv"
 diet_dir <- "/PATH/TO/AES_ACRC_QTAB_diet_PC_Microba_248_pcenergy_PC13_clr.csv"
 pheno_dir <- "/PATH/TO/extracted_pheno/cognitive_crossancestry_child.pheno"
 sample_qc_dir <- "/PATH/TO/metrics.tsv"
-# sample_qc_dir <- "/Users/uqcyap3/Documents/Research/ASD/3_metagenomics/Microba_QC/Sample_QC.csv"
 
 ```
 
