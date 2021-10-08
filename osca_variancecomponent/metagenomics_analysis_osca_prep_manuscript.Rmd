@@ -1,0 +1,2943 @@
+---
+title: "Metagenomics OSCA analysis prep"
+author: "by Chloe Yap - `r format(Sys.time(), '%d %B %Y')`"
+output:
+  epuRate::PCTG:
+    toc: TRUE
+    code_folding: "hide"
+  html_document:
+    self_contained: no
+---
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# You need these libraries to run this template:
+library(rmarkdown)    # install.packages("rmarkdown") 
+library(epuRate)      # devtools::install_github("holtzy/epuRate", force=TRUE)
+library(DT)
+library(mixOmics)
+```
+
+# Metagenomics OSCA analysis overview
+
+**Motivation**
+
+- calculate variance explained by bacterial microbiome and functional data
+- look for associations between phenotypes (ASD/nonASD, dietary PC1, Bristol Stool Scale) and the microbiome in a mixed linear model framework
+- dissect relative contributions of taxonomic and functional information to ASD, dietary PCs and Bristol Stool Chart (--mgrm analyses)
+
+**Datasets**
+
+- phenotypes: 
+    - ASD/nonASD
+    - 3 dietary PCs
+    - Bristol Stool Scale
+- OSCA matrices:
+    - taxonomic 
+        - collapsed to species, genera, family levels
+    - functional
+        - Enzyme Commission (collapsed to level 4 and level 3)
+        - TCDB (focused on transporters)
+        - MetaCyc pathways
+
+**Methods**
+
+- calculate the median read count for each taxa/functional variable (different taxonomic levels shown below: species, genera, family)
+    - "common" taxa/functional variables: filter out taxa with median read count < 0 (motivation: reduce zero-inflated taxa)
+    - "rare" taxa/functional variables: filter out variable with <10 non-zero values + filter out variable with median read count > 0
+- perform centred-log-ratio transformation, and check distribution to have centrality (suggested by Restu)
+- create matrix for use to input into OSCA
+- OSCA analyses (see script: metagenomics_analysis_osca.sh)
+    - variance explained
+
+# Pre-OSCA prep
+
+- (copied over from metagenomics_familytaxa_matrix.R)
+
+## Libraries and directories
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(data.table)
+library(stringr)
+library(tidyverse)
+library(compositions)
+options(stringsAsFactors = FALSE)
+library(ggrepel)
+library(reshape2)
+library(qqman)
+```
+
+```{r}
+
+# Directories
+taxa_dir <- "/PATH/TO/processed_data/taxonomic_profiles/profiles_relativeabundance.tsv"
+#taxa_count_dir <- "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/processed_data/taxonomic_profiles/profiles_counts.tsv"
+taxa_count_dir <- "/PATH/TO/processed_data/taxonomic_profiles/profiles_counts_MGDBv2ext.tsv"
+ec_dir <- "/PATH/TO/processed_data/autism_MCPv2_MGDBv2_functional/functional_profiles/by_sample/EC.samples.tsv.gz"
+tcdb_dir <- "/PATH/TO/processed_data/autism_MCPv2_MGDBv2_functional/functional_profiles/by_sample/TCDB.samples.tsv.gz"
+mcpath_dir <- "/PATH/TO/processed_data/autism_MCPv2_MGDBv2_functional/functional_profiles/by_sample/MetaCyc_pathway.samples.tsv.gz"
+func_dir <- "/PATH/TO/processed_data/autism_MCPv2_MGDBv2_functional/functional_profiles/by_sample/MICROBA.samples.tsv.gz"
+diet_dir <- "/PATH/TO/Diet/AES_ACRC_QTAB/AES_ACRC_QTAB_diet_PC_Microba_248_pcenergy_PC13_clr.csv"
+pheno_dir <- "/PATH/TO/Phenotype/extracted_pheno/cognitive_crossancestry_child.pheno"
+sample_qc_dir <- "/PATH/TO/processed_data/metrics.tsv"
+
+metaphlan2_dir <- "/PATH/TO/profile/metaphlan2_output_aggregated_7M/metaphlan2_taxonomy_species_abundance_table.txt"
+humann2_dir <- "/PATH/TO/profile/humann2_output_aggregated_7M/humann2_genefamilies_cpm_table.tsv"
+
+```
+
+```{r}
+
+# Function to automate a plot of effect size vs -log10(p)
+# https://hbctraining.github.io/Training-modules/Visualization_in_R/lessons/03_advanced_visualizations.html
+
+effect_p_plot <- function(df, title = NULL) {
+
+  df$threshold <- p.adjust(df$p, method = "BH") < 0.05
+  
+  ## Sort by ordered padj
+  df <- df[order(df$p), ] 
+  
+  ## Create a column to indicate which genes to label
+  df$Probelabels <- ""
+  df$Probelabels[1:10] <- df$Probe[1:10]
+  
+  if ("b" %in% colnames(df)) {
+    
+    df.gg <- ggplot(df) +
+    geom_point(aes(x = b, y = -log10(p), colour = threshold)) +
+    geom_text_repel(aes(x = b, y = -log10(p), label = ifelse(Probelabels != "", Probelabels,""))) +
+    ggtitle(paste("Effect size (b) vs p-value plot:", title, sep = " ")) +
+    xlab("beta") + 
+    ylab("-log10 adjusted p-value") +
+    #scale_y_continuous(limits = c(0,50)) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = rel(1.5), hjust = 0.5),
+          axis.title = element_text(size = rel(1.25)))  
+    
+  } else if ("OR" %in% colnames(df)) {
+    
+    df.gg <- ggplot(df) +
+    geom_point(aes(x = OR, y = -log10(p), colour = threshold)) +
+    geom_text_repel(aes(x = OR, y = -log10(p), label = ifelse(Probelabels != "", Probelabels,""))) +
+    ggtitle(paste("Effect size (OR) vs p-value plot:", title, sep = " ")) +
+    xlab("beta") + 
+    ylab("-log10 adjusted p-value") +
+    #scale_y_continuous(limits = c(0,50)) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = rel(1.5), hjust = 0.5),
+          axis.title = element_text(size = rel(1.25)))      
+  }
+
+  return(df.gg)
+
+}
+
+```
+
+## Data cleaning
+
+### Dietary data cleaning
+
+```{r}
+
+diet <- read.csv(diet_dir, header = T, as.is = T)
+
+# Sort the pheno/covariates file
+diet <- diet[order(diet$MG_SampleID),]
+
+# Remove excluded individuals
+diet <- diet %>% filter(!IID %in% c(4494902)) # Smith Magenis syndrome
+diet <- diet %>% filter(participant_type %in% c("ASD", "SIB", "UNR")) %>% filter(participant_type_study %in% c("ASD", "SIB", "UNR", "UNR_QTAB")) # a double check, in case I eventually exclude others using a similar coding system
+
+# Clean BSC data
+diet$bristol_stool_chart_regroup <- NA
+diet$bristol_stool_chart_regroup[which(diet$bristol_stool_chart %in% 1:2)] <- 2
+diet$bristol_stool_chart_regroup[which(diet$bristol_stool_chart == 3)] <- 3
+diet$bristol_stool_chart_regroup[which(diet$bristol_stool_chart == 4)] <- 4
+diet$bristol_stool_chart_regroup[which(diet$bristol_stool_chart %in% 5:7)] <- 5
+diet$bristol_stool_chart_regroup <- as.factor(diet$bristol_stool_chart_regroup)
+
+# Make meds_antibiotic_current == 0 for QTAB (ie. just none reported for sensitivity analysis). Makes data munging easier (NAs are otherwise excluded)
+diet$meds_antibiotic_current[which(is.na(diet$meds_antibiotic_current))] <- 0
+
+# Get a diet file without missing data
+diet_full <- diet %>% filter(!is.na(PC1_diet_pe))
+
+```
+
+### Taxa count tables
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Read in data
+taxa <- fread(taxa_dir)
+taxa_count <- fread(taxa_count_dir)
+pheno <- read.delim(pheno_dir, header = T, as.is = T)
+pheno <- pheno %>% filter(metagenomics_done == 1)
+sample_qc <- read.delim(sample_qc_dir, header = T, as.is = T)
+
+# Rename columns
+count_cols <- grep("BBC", colnames(taxa_count))
+colnames(taxa_count)[count_cols] <- substring(colnames(taxa_count)[count_cols], 1, 7)
+colnames(taxa_count)[2] <- "GTDB.taxonomy"
+
+# Take individuals included in this analysis
+taxa_count <- data.frame(taxa_count)
+taxa_count_keep <- which(colnames(taxa_count) %in% diet$MG_SampleID)
+taxa_count <- data.frame(Taxon = taxa_count$Taxon, 
+	GTDB.taxonomy = taxa_count$GTDB.taxonomy, 
+	sapply(taxa_count[,taxa_count_keep], function(x) x/2), stringsAsFactors = FALSE) # divide read counts by 2 in updated MCPv2
+
+# Add column of unassigned reads in count table
+count_cols <- grep("BBC", colnames(taxa_count))
+
+colnames(sample_qc)[which(colnames(sample_qc) == "ID")] <- "SampleID"
+sample_qc$SampleID <- substring(sample_qc$SampleID, 1, 7)
+sample_qc <- sample_qc %>% filter(SampleID %in% diet$MG_SampleID) %>% arrange(SampleID)
+sum.tmp <- colSums(data.frame(taxa_count[,count_cols]))
+
+identical(as.character(names(sum.tmp)), colnames(taxa_count[,count_cols]))
+
+unassigned <- as.numeric(sample_qc$TOTAL_DOWNSAMPLED - sum.tmp)
+names(unassigned) <- colnames(taxa_count)[3:ncol(taxa_count)]
+# taxa_count <- rbind(taxa_count, c("UNASSIGNED", "UNASSIGNED", unassigned))
+taxa_count[nrow(taxa_count) + 1,] <- NA
+taxa_count[nrow(taxa_count), "Taxon"] <- "UNASSIGNED"
+taxa_count[nrow(taxa_count), "GTDB.taxonomy"] <- "UNASSIGNED"
+taxa_count[nrow(taxa_count), 3:ncol(taxa_count)] <- unassigned
+
+taxa_count_keep <- taxa_count # Do this so can re-use code when subsetting by genus
+
+```
+
+#### MetaPhlAn2 tables
+
+```{r}
+
+# Read in data
+metaphlan2 <- fread(metaphlan2_dir)
+pheno <- read.delim(pheno_dir, header = T, as.is = T)
+pheno <- pheno %>% filter(metagenomics_done == 1)
+sample_qc <- read.delim(sample_qc_dir, header = T, as.is = T)
+
+# Rename the columns
+colnames(metaphlan2) <- unlist(lapply(strsplit(colnames(metaphlan2), "-"), function(x) x[1]))
+colnames(metaphlan2)[1] <- "Taxon"
+
+# Factors to characters
+metaphlan2$Taxon <- as.character(metaphlan2$Taxon)
+metaphlan2 <- data.frame(metaphlan2)
+
+# Update IDs
+metaphlan2_keep <- c(1,which(colnames(metaphlan2) %in% diet$MG_SampleID))
+metaphlan2 <- metaphlan2[,metaphlan2_keep]
+
+```
+
+### Functional tables
+
+#### Enzyme Commission
+
+```{r}
+
+ec <- fread(ec_dir)
+
+# Take individuals included in this analysis
+ec <- data.frame(ec)
+ec_keep <- which(colnames(ec) %in% diet$MG_SampleID)
+
+# Left out the UNASSIGNED column generation
+
+ec_keep <- ec
+
+```
+
+#### TCDB
+
+- Left out the UNASSIGNED column generation, as it looks like the numbers don't quite add up ...
+
+```{r}
+
+tcdb <- fread(tcdb_dir)
+
+# Take individuals included in this analysis
+tcdb <- data.frame(tcdb)
+tcdb_keep <- which(colnames(tcdb) %in% diet$MG_SampleID)
+
+# Left out the UNASSIGNED column generation
+
+tcdb_keep <- tcdb
+
+```
+
+#### MetaCyc Pathways
+
+```{r}
+
+mcpath <- fread(mcpath_dir)
+
+# Take individuals included in this analysis
+mcpath <- data.frame(mcpath)
+mcpath_keep <- which(colnames(mcpath) %in% diet$MG_SampleID)
+
+# Left out the UNASSIGNED column generation
+
+mcpath_keep <- mcpath
+
+```
+
+#### Microba functional table
+
+```{r}
+
+func <- fread(func_dir)
+
+# Take individuals included in this analysis
+func <- data.frame(func)
+func_keep <- which(colnames(func) %in% diet$MG_SampleID)
+
+# Left out the UNASSIGNED column generation
+
+func_keep <- func
+
+```
+
+#### MetaPhlAn2 tables
+
+```{r}
+
+# Read in data
+humann2 <- fread(humann2_dir)
+
+# Rename the columns
+colnames(humann2) <- unlist(lapply(strsplit(colnames(humann2), "-"), function(x) x[1]))
+colnames(humann2)[1] <- "VariableID"
+
+# Factors to characters
+humann2$Taxon <- as.character(humann2$Taxon)
+humann2 <- data.frame(humann2)
+
+# Remove UNMAPPED column
+humann2 <- humann2[-which(humann2$VariableID %in% c("UNMAPPED", "UniRef90_unknown")),]
+
+# Update IDs
+humann2_keep <- c(1,which(colnames(humann2) %in% diet$MG_SampleID))
+humann2 <- humann2[,humann2_keep]
+
+```
+
+## Collapse to species
+
+- n=93 species passing filters
+
+### Take species OTUs
+
+```{r}
+
+taxa_count <- taxa_count_keep
+
+species <- taxa_count$Taxon
+species <- substring(species, 4)
+
+taxa_count$Taxon <- species
+colnames(taxa_count)[which(colnames(taxa_count) == "Taxon")] <- "Species"
+taxa_count[which(taxa_count$GTDB.taxonomy == "UNASSIGNED"), "Species"] <- "UNASSIGNED"
+
+```
+
+### Collapse
+
+```{r}
+
+species_uniq <- unique(species)
+count_cols <- grep("BBC", colnames(taxa_count))
+
+taxa_count_species.mat <- matrix(nrow = length(species_uniq), ncol = length(count_cols))
+for (i in 1:length(species_uniq)) {
+	taxa_count_species.mat[i,] <- colSums(taxa_count[which(taxa_count$Species == species_uniq[i]),count_cols])
+}
+colnames(taxa_count_species.mat) <- colnames(taxa_count)[count_cols]
+taxa_count_species <- data.frame(Species = as.character(species_uniq), taxa_count_species.mat)
+
+# Some summary statistics
+species_stats <- data.frame(Species = as.character(taxa_count_species$Species), 
+	q25_count = as.numeric(apply(taxa_count_species.mat, 1, function(x) quantile(x, 0.25))),
+	median_count = as.numeric(apply(taxa_count_species.mat, 1, median)),
+	mean_count = as.numeric(apply(taxa_count_species.mat, 1, mean)), stringsAsFactors = FALSE)
+summary(species_stats$median_count)
+summary(species_stats$mean_count)
+species_stats <- species_stats[order(species_stats$median_count, decreasing = TRUE),]
+
+datatable(species_stats)
+
+write.table(species_stats, "/PATH/TO/taxa_count_species_stats.txt",
+	col.names = T, row.names = F, quote = F, sep = "\t")
+
+# Define "common" taxa as those with median > 0
+# Have also generate 25th quartile column, 
+# as this is more likely to be normally distributed 
+# (or at least less zero-inflated)
+species_common <- species_stats$Species[which(species_stats$median_count > 0)]
+
+```
+
+### Identify common taxa
+
+```{r}
+
+count_cols <- grep("BBC", colnames(taxa_count_species))
+
+taxa_count_species_common <- taxa_count_species[which(taxa_count_species$Species %in% species_common),]
+
+# Visualise the distribution
+# 31 is for QAND01 which had the lowest median
+# foo <- as.numeric(taxa_count_family_common[31,2:ncol(taxa_count_family_common)])
+# hist(foo)
+
+```
+
+### Check distribution
+
+```{r}
+
+tmp <- round(length(species_common)/5)
+dist1 <- species_common[1:tmp]
+dist2 <- species_common[(tmp+1):(2*tmp)]
+dist3 <- species_common[((2*tmp)+1):(3*tmp)]
+dist4 <- species_common[((3*tmp)+1):(4*tmp)]
+dist5 <- species_common[((4*tmp)+1):length(species_common)]
+
+taxa_count_species_common.long <- reshape2::melt(taxa_count_species_common, id.vars=c("Species"), variable.name="ID", value.name = "Read_count")
+library(plyr)
+mu <- ddply(taxa_count_species_common.long, "Species", summarise, grp.mean=mean(Read_count))
+mu1 <- mu %>% filter(Species %in% dist1)
+mu2 <- mu %>% filter(Species %in% dist2)
+mu3 <- mu %>% filter(Species %in% dist3)
+mu4 <- mu %>% filter(Species %in% dist4)
+mu5 <- mu %>% filter(Species %in% dist5)
+
+taxa_count_species_common.long1 <- taxa_count_species_common.long %>% filter(Species %in% dist1)
+taxa_count_species_common.long2 <- taxa_count_species_common.long %>% filter(Species %in% dist2)
+taxa_count_species_common.long3 <- taxa_count_species_common.long %>% filter(Species %in% dist3)
+taxa_count_species_common.long4 <- taxa_count_species_common.long %>% filter(Species %in% dist4)
+taxa_count_species_common.long5 <- taxa_count_species_common.long %>% filter(Species %in% dist5)
+
+ggplot(taxa_count_species_common.long1, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(taxa_count_species_common.long2, aes(x = Read_count, color = Species)) +
+#  geom_density() + 
+#  theme(legend.position="bottom")
+ggplot(taxa_count_species_common.long3, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(taxa_count_species_common.long4, aes(x = Read_count, color = Species)) +
+#  geom_density() + 
+#  theme(legend.position="bottom")
+ggplot(taxa_count_species_common.long5, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+taxa_count_species_common_clr <- taxa_count_species_common
+tmp <- as.matrix(taxa_count_species_common_clr[,2:ncol(taxa_count_species_common_clr)])
+taxa_count_species_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(taxa_count_species_common_clr.tmp) <- "matrix"
+
+taxa_count_species_common_clr <- data.frame(Species = taxa_count_species_common$Species, taxa_count_species_common_clr.tmp)
+
+```
+
+### Check distribution after clr transformation
+
+- Restu said should be fine to use so long as there is some centrality
+
+```{r}
+
+tmp <- round(length(species_common)/5)
+dist1 <- species_common[1:tmp]
+dist2 <- species_common[(tmp+1):(2*tmp)]
+dist3 <- species_common[((2*tmp)+1):(3*tmp)]
+dist4 <- species_common[((3*tmp)+1):(4*tmp)]
+dist5 <- species_common[((4*tmp)+1):length(species_common)]
+
+taxa_count_species_common_clr.long <- reshape2::melt(taxa_count_species_common_clr, id.vars=c("Species"), variable.name="ID", value.name = "Read_count")
+library(plyr)
+mu <- ddply(taxa_count_species_common_clr.long, "Species", summarise, grp.mean=mean(Read_count))
+mu1 <- mu %>% filter(Species %in% dist1)
+mu2 <- mu %>% filter(Species %in% dist2)
+mu3 <- mu %>% filter(Species %in% dist3)
+mu4 <- mu %>% filter(Species %in% dist4)
+mu5 <- mu %>% filter(Species %in% dist5)
+
+taxa_count_species_common_clr.long1 <- taxa_count_species_common_clr.long %>% filter(Species %in% dist1)
+taxa_count_species_common_clr.long2 <- taxa_count_species_common_clr.long %>% filter(Species %in% dist2)
+taxa_count_species_common_clr.long3 <- taxa_count_species_common_clr.long %>% filter(Species %in% dist3)
+taxa_count_species_common_clr.long4 <- taxa_count_species_common_clr.long %>% filter(Species %in% dist4)
+taxa_count_species_common_clr.long5 <- taxa_count_species_common_clr.long %>% filter(Species %in% dist5)
+
+ggplot(taxa_count_species_common_clr.long1, aes(x = Read_count, color = Species)) +
+  geom_density() +
+  theme(legend.position="bottom")
+# ggplot(taxa_count_species_common_clr.long2, aes(x = Read_count, color = Species)) +
+#  geom_density() + 
+#  theme(legend.position="bottom")
+ggplot(taxa_count_species_common_clr.long3, aes(x = Read_count, color = Species)) +
+  geom_density() + ylim(c(0,2)) +
+  theme(legend.position="bottom")
+ggplot(taxa_count_species_common_clr.long3, aes(x = Read_count, color = Species)) +
+  geom_density() +
+  theme(legend.position="bottom")
+# ggplot(taxa_count_species_common_clr.long4, aes(x = Read_count, color = Species)) +
+#  geom_density() +
+#  theme(legend.position="bottom")
+# ggplot(taxa_count_species_common_clr.long4, aes(x = Read_count, color = Species)) +
+#  geom_density() + ylim(c(0,2)) +
+#  theme(legend.position="bottom")
+ggplot(taxa_count_species_common_clr.long5, aes(x = Read_count, color = Species)) +
+  geom_density() +
+  theme(legend.position="bottom")
+ggplot(taxa_count_species_common_clr.long5, aes(x = Read_count, color = Species)) +
+  geom_density() + ylim(c(0,2))
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(taxa_count_species_common_clr$Species)
+taxa_count_species_common_clr_t <- as.data.frame(t(taxa_count_species_common_clr[,-(1)]))
+colnames(taxa_count_species_common_clr_t) <- n
+taxa_count_species_common_clr_t <- data.frame(MG_SampleID = rownames(taxa_count_species_common_clr_t), taxa_count_species_common_clr_t)
+taxa_count_species_common_clr_t <- taxa_count_species_common_clr_t[order(taxa_count_species_common_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+taxa_count_species_common_clr_t <- taxa_count_species_common_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(taxa_count_species_common_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, taxa_count_species_common_clr_t[,2:ncol(taxa_count_species_common_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/taxa_count_species_common_clrcheck_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Collapse to genus
+
+### Take family OTUs
+
+```{r}
+
+taxa_count <- taxa_count_keep
+
+taxonomy <- taxa_count$GTDB.taxonomy
+genus <- unlist(lapply(strsplit(taxonomy, ";"), function(x) x[6]))
+genus <- substring(genus, 5)
+
+taxa_count$Taxon <- genus
+colnames(taxa_count)[which(colnames(taxa_count) == "Taxon")] <- "Genus"
+taxa_count[which(taxa_count$GTDB.taxonomy == "UNASSIGNED"), "Genus"] <- "UNASSIGNED"
+
+```
+
+### Collapse
+
+```{r}
+
+genus_uniq <- unique(genus)
+count_cols <- grep("BBC", colnames(taxa_count))
+
+taxa_count_genus.mat <- matrix(nrow = length(genus_uniq), ncol = length(count_cols))
+for (i in 1:length(genus_uniq)) {
+	taxa_count_genus.mat[i,] <- colSums(taxa_count[which(taxa_count$Genus == genus_uniq[i]),count_cols])
+}
+colnames(taxa_count_genus.mat) <- colnames(taxa_count)[count_cols]
+taxa_count_genus <- data.frame(Genus = as.character(genus_uniq), taxa_count_genus.mat)
+
+# Some summary statistics
+genus_stats <- data.frame(Genus = as.character(taxa_count_genus$Genus), 
+	q25_count = as.numeric(apply(taxa_count_genus.mat, 1, function(x) quantile(x, 0.25))),
+	median_count = as.numeric(apply(taxa_count_genus.mat, 1, median)),
+	mean_count = as.numeric(apply(taxa_count_genus.mat, 1, mean)), stringsAsFactors = FALSE)
+summary(genus_stats$median_count)
+summary(genus_stats$mean_count)
+genus_stats <- genus_stats[order(genus_stats$median_count, decreasing = TRUE),]
+
+datatable(genus_stats)
+
+write.table(genus_stats, "/PATH/TO/taxa_count_genus_stats.txt",
+	col.names = T, row.names = F, quote = F, sep = "\t")
+
+# Define "common" taxa as those with median > 0
+# Have also generate 25th quartile column, 
+# as this is more likely to be normally distributed 
+# (or at least less zero-inflated)
+genus_common <- genus_stats$Genus[which(genus_stats$median_count > 0)]
+
+```
+
+### Identify common taxa
+
+```{r}
+
+count_cols <- grep("BBC", colnames(taxa_count_genus))
+
+taxa_count_genus_common <- taxa_count_genus[which(taxa_count_genus$Genus %in% genus_common),]
+
+```
+
+### Check distribution
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+tmp <- round(length(genus_common)/3)
+dist1 <- genus_common[1:tmp]
+dist2 <- genus_common[(tmp+1):(2*tmp)]
+dist3 <- genus_common[((2*tmp)+1):length(genus_common)]
+
+taxa_count_genus_common.long <- reshape2::melt(taxa_count_genus_common, id.vars=c("Genus"), variable.name="ID", value.name = "Read_count")
+library(plyr)
+mu <- ddply(taxa_count_genus_common.long, "Genus", summarise, grp.mean=mean(Read_count))
+mu1 <- mu %>% filter(Genus %in% dist1)
+mu2 <- mu %>% filter(Genus %in% dist2)
+mu3 <- mu %>% filter(Genus %in% dist3)
+
+taxa_count_genus_common.long1 <- taxa_count_genus_common.long %>% filter(Genus %in% dist1)
+taxa_count_genus_common.long2 <- taxa_count_genus_common.long %>% filter(Genus %in% dist2)
+taxa_count_genus_common.long3 <- taxa_count_genus_common.long %>% filter(Genus %in% dist3)
+
+ggplot(taxa_count_genus_common.long1, aes(x = Read_count, color = Genus)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(taxa_count_genus_common.long2, aes(x = Read_count, color = Genus)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(taxa_count_genus_common.long3, aes(x = Read_count, color = Genus)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+taxa_count_genus_common_clr <- taxa_count_genus_common
+tmp <- as.matrix(taxa_count_genus_common_clr[,2:ncol(taxa_count_genus_common_clr)])
+taxa_count_genus_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(taxa_count_genus_common_clr.tmp) <- "matrix"
+
+taxa_count_genus_common_clr <- data.frame(Genus = taxa_count_genus_common$Genus, taxa_count_genus_common_clr.tmp)
+
+```
+
+### Check distribution after clr transformation
+
+- Restu said should be fine to use so long as there is some centrality
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+tmp <- round(length(genus_common)/3)
+dist1 <- genus_common[1:tmp]
+dist2 <- genus_common[(tmp+1):(2*tmp)]
+dist3 <- genus_common[((2*tmp)+1):length(genus_common)]
+
+taxa_count_genus_common_clr.long <- reshape2::melt(taxa_count_genus_common_clr, id.vars=c("Genus"), variable.name="ID", value.name = "Read_count")
+library(plyr)
+mu <- ddply(taxa_count_genus_common.long, "Genus", summarise, grp.mean=mean(Read_count))
+mu1 <- mu %>% filter(Genus %in% dist1)
+mu2 <- mu %>% filter(Genus %in% dist2)
+mu3 <- mu %>% filter(Genus %in% dist3)
+
+taxa_count_genus_common_clr.long1 <- taxa_count_genus_common_clr.long %>% filter(Genus %in% dist1)
+taxa_count_genus_common_clr.long2 <- taxa_count_genus_common_clr.long %>% filter(Genus %in% dist2)
+taxa_count_genus_common_clr.long3 <- taxa_count_genus_common_clr.long %>% filter(Genus %in% dist3)
+
+ggplot(taxa_count_genus_common_clr.long1, aes(x = Read_count, color = Genus)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+#ggplot(taxa_count_genus_common_clr.long2, aes(x = Read_count, color = Genus)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(taxa_count_genus_common_clr.long3, aes(x = Read_count, color = Genus)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(taxa_count_genus_common_clr$Genus)
+taxa_count_genus_common_clr_t <- as.data.frame(t(taxa_count_genus_common_clr[,-(1)]))
+colnames(taxa_count_genus_common_clr_t) <- n
+taxa_count_genus_common_clr_t <- data.frame(MG_SampleID = rownames(taxa_count_genus_common_clr_t), taxa_count_genus_common_clr_t)
+taxa_count_genus_common_clr_t <- taxa_count_genus_common_clr_t[order(taxa_count_genus_common_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+taxa_count_genus_common_clr_t <- taxa_count_genus_common_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(taxa_count_genus_common_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, taxa_count_genus_common_clr_t[,2:ncol(taxa_count_genus_common_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/taxa_count_genus_common_clrcheck_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Collapse to families
+
+### Take family OTUs
+
+```{r}
+
+taxa_count <- taxa_count_keep
+
+taxonomy <- taxa_count$GTDB.taxonomy
+family <- unlist(lapply(strsplit(taxonomy, ";"), function(x) x[5]))
+family <- substring(family, 5)
+
+taxa_count$Taxon <- family
+colnames(taxa_count)[which(colnames(taxa_count) == "Taxon")] <- "Family"
+taxa_count[which(taxa_count$GTDB.taxonomy == "UNASSIGNED"), "Family"] <- "UNASSIGNED"
+
+```
+
+### Collapse
+
+```{r}
+
+family_uniq <- unique(family)
+count_cols <- grep("BBC", colnames(taxa_count))
+
+taxa_count_family.mat <- matrix(nrow = length(family_uniq), ncol = length(count_cols))
+for (i in 1:length(family_uniq)) {
+	taxa_count_family.mat[i,] <- colSums(taxa_count[which(taxa_count$Family == family_uniq[i]),count_cols])
+}
+colnames(taxa_count_family.mat) <- colnames(taxa_count)[count_cols]
+taxa_count_family <- data.frame(Family = as.character(family_uniq), taxa_count_family.mat)
+
+# Some summary statistics
+family_stats <- data.frame(Family = as.character(taxa_count_family$Family), 
+	q25_count = as.numeric(apply(taxa_count_family.mat, 1, function(x) quantile(x, 0.25))),
+	median_count = as.numeric(apply(taxa_count_family.mat, 1, median)),
+	mean_count = as.numeric(apply(taxa_count_family.mat, 1, mean)), stringsAsFactors = FALSE)
+summary(family_stats$median_count)
+summary(family_stats$mean_count)
+family_stats <- family_stats[order(family_stats$median_count, decreasing = TRUE),]
+
+datatable(family_stats)
+
+write.table(family_stats, "/PATH/TO/taxa_count_family_stats.txt",
+	col.names = T, row.names = F, quote = F, sep = "\t")
+
+# Define "common" taxa as those with median > 0
+# Have also generate 25th quartile column, 
+# as this is more likely to be normally distributed 
+# (or at least less zero-inflated)
+family_common <- family_stats[which(family_stats$median_count > 0),"Family"]
+
+```
+
+### Identify common taxa
+
+```{r}
+
+count_cols <- grep("BBC", colnames(taxa_count_family))
+
+taxa_count_family_common <- taxa_count_family[which(taxa_count_family$Family %in% family_common),]
+
+```
+
+### Check distribution
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+tmp <- round(length(family_common)/3)
+dist1 <- family_common[1:tmp]
+dist2 <- family_common[(tmp+1):(2*tmp)]
+dist3 <- family_common[((2*tmp)+1):length(family_common)]
+
+taxa_count_family_common.long <- reshape2::melt(taxa_count_family_common, id.vars=c("Family"), variable.name="ID", value.name = "Read_count")
+library(plyr)
+mu <- ddply(taxa_count_family_common.long, "Family", summarise, grp.mean=mean(Read_count))
+mu1 <- mu %>% filter(Family %in% dist1)
+mu2 <- mu %>% filter(Family %in% dist2)
+mu3 <- mu %>% filter(Family %in% dist3)
+
+taxa_count_family_common.long1 <- taxa_count_family_common.long %>% filter(Family %in% dist1)
+taxa_count_family_common.long2 <- taxa_count_family_common.long %>% filter(Family %in% dist2)
+taxa_count_family_common.long3 <- taxa_count_family_common.long %>% filter(Family %in% dist3)
+
+ggplot(taxa_count_family_common.long1, aes(x = Read_count, color = Family)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(taxa_count_family_common.long2, aes(x = Read_count, color = Family)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(taxa_count_family_common.long3, aes(x = Read_count, color = Family)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+taxa_count_family_common_clr <- taxa_count_family_common
+tmp <- as.matrix(taxa_count_family_common_clr[,2:ncol(taxa_count_family_common_clr)])
+taxa_count_family_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(taxa_count_family_common_clr.tmp) <- "matrix"
+
+taxa_count_family_common_clr <- data.frame(Family = taxa_count_family_common$Family, taxa_count_family_common_clr.tmp)
+
+```
+
+### Check distribution after clr transformation
+
+- Restu said should be fine to use so long as there is some centrality
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+tmp <- round(length(family_common)/3)
+dist1 <- family_common[1:tmp]
+dist2 <- family_common[(tmp+1):(2*tmp)]
+dist3 <- family_common[((2*tmp)+1):length(family_common)]
+
+taxa_count_family_common_clr.long <- reshape2::melt(taxa_count_family_common_clr, id.vars=c("Family"), variable.name="ID", value.name = "Read_count")
+library(plyr)
+mu <- ddply(taxa_count_family_common.long, "Family", summarise, grp.mean=mean(Read_count))
+mu1 <- mu %>% filter(Family %in% dist1)
+mu2 <- mu %>% filter(Family %in% dist2)
+mu3 <- mu %>% filter(Family %in% dist3)
+
+taxa_count_family_common_clr.long1 <- taxa_count_family_common_clr.long %>% filter(Family %in% dist1)
+taxa_count_family_common_clr.long2 <- taxa_count_family_common_clr.long %>% filter(Family %in% dist2)
+taxa_count_family_common_clr.long3 <- taxa_count_family_common_clr.long %>% filter(Family %in% dist3)
+
+ggplot(taxa_count_family_common_clr.long1, aes(x = Read_count, color = Family)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(taxa_count_family_common_clr.long2, aes(x = Read_count, color = Family)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(taxa_count_family_common_clr.long3, aes(x = Read_count, color = Family)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(taxa_count_family_common_clr$Family)
+taxa_count_family_common_clr_t <- as.data.frame(t(taxa_count_family_common_clr[,-(1)]))
+colnames(taxa_count_family_common_clr_t) <- n
+taxa_count_family_common_clr_t <- data.frame(MG_SampleID = rownames(taxa_count_family_common_clr_t), taxa_count_family_common_clr_t)
+taxa_count_family_common_clr_t <- taxa_count_family_common_clr_t[order(taxa_count_family_common_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+taxa_count_family_common_clr_t <- taxa_count_family_common_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(taxa_count_family_common_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, taxa_count_family_common_clr_t[,2:ncol(taxa_count_family_common_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/taxa_count_family_common_clrcheck_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Take ~all species
+
+```{r}
+
+taxa_count <- taxa_count_keep
+
+count_cols <- grep("BBC", colnames(taxa_count))
+
+# Filter 1: based on features across number of samples (<10 non-zero samples)
+zero_count <- unlist(lapply(1:nrow(taxa_count), function(x) length(which(taxa_count[x,] == 0))))
+hist(zero_count)
+zero_rm <- which(zero_count > ((ncol(taxa_count) - 2) - 10))
+zero_rm_taxa <- taxa_count$Taxon[zero_rm]
+
+# Filter 2: based on reads across number of samples (<100 assigned reads in at least one sample)
+maxcount_reads <- as.numeric(sapply(taxa_count[,count_cols], max))
+zero_reads_rm <- which(maxcount_reads < 100)
+
+taxa_count_rm0 <- taxa_count[-zero_rm,]
+
+taxa_count_species_rm0 <- taxa_count_rm0
+#taxa_count_species_rm0.tmp <- data.frame(clr(as.matrix(taxa_count_rm0[,3:ncol(taxa_count_rm0)])))
+#taxa_count_species_rm0 <- data.frame(Species = taxa_count_rm0$Taxon, taxa_count_species_rm0.tmp)
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+taxa_count_species_rm0_clr <- taxa_count_species_rm0
+tmp <- as.matrix(taxa_count_species_rm0_clr[,3:ncol(taxa_count_species_rm0_clr)])
+taxa_count_species_rm0_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(taxa_count_species_rm0_clr.tmp) <- "matrix"
+
+taxa_count_species_rm0_clr <- data.frame(Species = taxa_count_species_rm0$Taxon, taxa_count_species_rm0_clr.tmp)
+
+```
+
+### Check distribution
+
+- below is only an illustration of 40
+- point being that the distributions do look funny --> not sure whether it violates model assumptions
+
+```{r}
+
+tmp <- round(length(taxa_count_species_rm0_clr$Species)/10)
+dist1 <- taxa_count_species_rm0_clr$Species[1:tmp]
+dist2 <- taxa_count_species_rm0_clr$Species[(tmp+1):(2*tmp)]
+dist3 <- taxa_count_species_rm0_clr$Species[((2*tmp)+1):(3*tmp)]
+dist4 <- taxa_count_species_rm0_clr$Species[((3*tmp)+1):(4*tmp)]
+
+taxa_count_species_rm0_clr.long <- reshape2::melt(taxa_count_species_rm0_clr, id.vars=c("Species"), variable.name="ID", value.name = "Read_count")
+library(plyr)
+mu <- ddply(taxa_count_species_rm0_clr.long, "Species", summarise, grp.mean=mean(Read_count))
+mu1 <- mu %>% filter(Species %in% dist1)
+mu2 <- mu %>% filter(Species %in% dist2)
+mu3 <- mu %>% filter(Species %in% dist3)
+mu4 <- mu %>% filter(Species %in% dist4)
+
+taxa_count_species_rm0_clr.long1 <- taxa_count_species_rm0_clr.long %>% filter(Species %in% dist1)
+taxa_count_species_rm0_clr.long2 <- taxa_count_species_rm0_clr.long %>% filter(Species %in% dist2)
+taxa_count_species_rm0_clr.long3 <- taxa_count_species_rm0_clr.long %>% filter(Species %in% dist3)
+taxa_count_species_rm0_clr.long4 <- taxa_count_species_rm0_clr.long %>% filter(Species %in% dist4)
+
+ggplot(taxa_count_species_rm0_clr.long1, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(taxa_count_species_rm0_clr.long2, aes(x = Read_count, color = Species)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+# ggplot(taxa_count_species_rm0_clr.long3, aes(x = Read_count, color = Species)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(taxa_count_species_rm0_clr.long4, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(taxa_count_species_rm0_clr$Species)
+taxa_count_species_rm0_clr_t <- as.data.frame(t(taxa_count_species_rm0_clr[,-(1)]))
+colnames(taxa_count_species_rm0_clr_t) <- n
+taxa_count_species_rm0_clr_t <- data.frame(MG_SampleID = rownames(taxa_count_species_rm0_clr_t), taxa_count_species_rm0_clr_t)
+taxa_count_species_rm0_clr_t <- taxa_count_species_rm0_clr_t[order(taxa_count_species_rm0_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+taxa_count_species_rm0_clr_t <- taxa_count_species_rm0_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(taxa_count_species_rm0_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, taxa_count_species_rm0_clr_t[,2:ncol(taxa_count_species_rm0_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/taxa_count_species_rm0_clrcheck_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Take "rare" (but not zero) samples
+
+- ie. median < 0, but <10 non-zero samples
+- n = 510 pass filters
+
+### Take species OTUs
+
+```{r}
+
+taxa_count <- taxa_count_keep
+
+species <- taxa_count$Taxon
+species <- substring(species, 4)
+
+taxa_count$Taxon <- species
+colnames(taxa_count)[which(colnames(taxa_count) == "Taxon")] <- "Species"
+taxa_count[which(taxa_count$GTDB.taxonomy == "UNASSIGNED"), "Species"] <- "UNASSIGNED"
+
+```
+
+### Remove (super) zero-inflated
+
+```{r}
+
+count_cols <- grep("BBC", colnames(taxa_count))
+
+# Filter 1: based on features across number of samples (<10 non-zero samples)
+zero_count <- unlist(lapply(1:nrow(taxa_count), function(x) length(which(taxa_count[x,] == 0))))
+hist(zero_count)
+zero_rm <- which(zero_count > ((ncol(taxa_count) - 2) - 10))
+zero_rm_taxa <- taxa_count$Taxon[zero_rm]
+
+# Filter 2: based on reads across number of samples (<100 assigned reads in at least one sample)
+maxcount_reads <- as.numeric(sapply(taxa_count[,count_cols], max))
+zero_reads_rm <- which(maxcount_reads < 100)
+
+taxa_count_species_rm0 <- taxa_count[-zero_rm,]
+
+```
+
+### Identify rare taxa 
+
+```{r}
+
+species_stats <- fread("/PATH/TO/taxa_count_species_stats.txt")
+
+species_rare <- species_stats$Species[which(species_stats$median_count == 0)]
+
+count_cols <- grep("BBC", colnames(taxa_count_species_rm0))
+
+taxa_count_species_rm0_rare <- taxa_count_species_rm0[which(taxa_count_species_rm0$Species %in% species_rare),]
+
+```
+
+### Presence/absence (0/1)
+
+- if count = 0
+
+```{r}
+
+taxa_count_species_rm0_rare_01 <- taxa_count_species_rm0_rare
+taxa_count_species_rm0_rare_01.tmp <- apply(taxa_count_species_rm0_rare_01[,3:ncol(taxa_count_species_rm0_rare_01)], 2, function(x) ifelse(x != 0, 1, 0))
+taxa_count_species_rm0_rare_01 <- data.frame(Species = taxa_count_species_rm0_rare$Species, taxa_count_species_rm0_rare_01.tmp)
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+taxa_count_species_rm0_rare_clr <- taxa_count_species_rm0_rare
+tmp <- as.matrix(taxa_count_species_rm0_rare_clr[,3:ncol(taxa_count_species_rm0_rare_clr)])
+taxa_count_species_rm0_rare_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(taxa_count_species_rm0_rare_clr.tmp) <- "matrix"
+
+taxa_count_species_rm0_rare_clr <- data.frame(Species = taxa_count_species_rm0_rare_clr$Species, taxa_count_species_rm0_rare_clr.tmp)
+
+```
+
+### Check distribution
+
+- below is only an illustration of 40
+- point being that the distributions do look funny --> not sure whether it violates model assumptions
+
+```{r}
+
+tmp <- round(length(taxa_count_species_rm0_rare_clr$Species)/10)
+dist1 <- taxa_count_species_rm0_rare_clr$Species[1:tmp]
+dist2 <- taxa_count_species_rm0_rare_clr$Species[(tmp+1):(2*tmp)]
+dist3 <- taxa_count_species_rm0_rare_clr$Species[((2*tmp)+1):(3*tmp)]
+dist4 <- taxa_count_species_rm0_rare_clr$Species[((3*tmp)+1):(4*tmp)]
+
+taxa_count_species_rm0_rare_clr.long <- reshape2::melt(taxa_count_species_rm0_rare_clr, id.vars=c("Species"), variable.name="ID", value.name = "Read_count")
+library(plyr)
+mu <- ddply(taxa_count_species_rm0_rare_clr.long, "Species", summarise, grp.mean=mean(Read_count))
+mu1 <- mu %>% filter(Species %in% dist1)
+mu2 <- mu %>% filter(Species %in% dist2)
+mu3 <- mu %>% filter(Species %in% dist3)
+mu4 <- mu %>% filter(Species %in% dist4)
+
+taxa_count_species_rm0_rare_clr.long1 <- taxa_count_species_rm0_rare_clr.long %>% filter(Species %in% dist1)
+taxa_count_species_rm0_rare_clr.long2 <- taxa_count_species_rm0_rare_clr.long %>% filter(Species %in% dist2)
+taxa_count_species_rm0_rare_clr.long3 <- taxa_count_species_rm0_rare_clr.long %>% filter(Species %in% dist3)
+taxa_count_species_rm0_rare_clr.long4 <- taxa_count_species_rm0_rare_clr.long %>% filter(Species %in% dist4)
+
+ggplot(taxa_count_species_rm0_rare_clr.long1, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(taxa_count_species_rm0_rare_clr.long2, aes(x = Read_count, color = Species)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+# ggplot(taxa_count_species_rm0_rare_clr.long3, aes(x = Read_count, color = Species)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(taxa_count_species_rm0_rare_clr.long4, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(taxa_count_species_rm0_rare_clr$Species)
+taxa_count_species_rm0_rare_clr_t <- as.data.frame(t(taxa_count_species_rm0_rare_clr[,-(1)]))
+colnames(taxa_count_species_rm0_rare_clr_t) <- n
+taxa_count_species_rm0_rare_clr_t <- data.frame(MG_SampleID = rownames(taxa_count_species_rm0_rare_clr_t), taxa_count_species_rm0_rare_clr_t)
+taxa_count_species_rm0_rare_clr_t <- taxa_count_species_rm0_rare_clr_t[order(taxa_count_species_rm0_rare_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+```{r}
+
+# Read counts, keep 0s
+n <- as.character(taxa_count_species_rm0_rare_01$Species)
+taxa_count_species_rm0_rare_01_t <- as.data.frame(t(taxa_count_species_rm0_rare_01[,-(1)]))
+colnames(taxa_count_species_rm0_rare_01_t) <- n
+taxa_count_species_rm0_rare_01_t <- data.frame(MG_SampleID = rownames(taxa_count_species_rm0_rare_01_t), taxa_count_species_rm0_rare_01_t)
+taxa_count_species_rm0_rare_01_t <- taxa_count_species_rm0_rare_01_t[order(taxa_count_species_rm0_rare_01_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+taxa_count_species_rm0_rare_clr_t <- taxa_count_species_rm0_rare_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+taxa_count_species_rm0_rare_01_t <- taxa_count_species_rm0_rare_01_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(taxa_count_species_rm0_rare_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, taxa_count_species_rm0_rare_clr_t[,2:ncol(taxa_count_species_rm0_rare_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/taxa_count_species_rm0_rare_clrcheck_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+```{r}
+
+# 1. Matrix
+identical(taxa_count_species_rm0_rare_01_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, taxa_count_species_rm0_rare_01_t[,2:ncol(taxa_count_species_rm0_rare_01_t)])
+write.table(osca_out, "/PATH/TO/osca/taxa_count_species_rm0_rare_01_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## MetaPhlAn2
+
+### Take species OTUs
+
+- For ease, name variable taxa_count, though being aware that this isn't actually a count ...
+
+```{r}
+
+species <- metaphlan2$Taxon
+
+colnames(metaphlan2)[which(colnames(metaphlan2) == "Taxon")] <- "Species"
+
+taxa_count <- metaphlan2
+
+```
+
+### Collapse
+
+```{r}
+
+species_uniq <- unique(species)
+count_cols <- grep("BBC", colnames(taxa_count))
+
+taxa_count_species.mat <- matrix(nrow = length(species_uniq), ncol = length(count_cols))
+for (i in 1:length(species_uniq)) {
+	taxa_count_species.mat[i,] <- colSums(taxa_count[which(taxa_count$Species == species_uniq[i]),count_cols])
+}
+colnames(taxa_count_species.mat) <- colnames(taxa_count)[count_cols]
+taxa_count_species <- data.frame(Species = as.character(species_uniq), taxa_count_species.mat)
+
+# Some summary statistics
+species_stats <- data.frame(Species = as.character(taxa_count_species$Species), 
+	q25_count = as.numeric(apply(taxa_count_species.mat, 1, function(x) quantile(x, 0.25))),
+	median_count = as.numeric(apply(taxa_count_species.mat, 1, median)),
+	mean_count = as.numeric(apply(taxa_count_species.mat, 1, mean)), stringsAsFactors = FALSE)
+summary(species_stats$median_count)
+summary(species_stats$mean_count)
+species_stats <- species_stats[order(species_stats$median_count, decreasing = TRUE),]
+
+datatable(species_stats)
+
+write.table(species_stats, "/PATH/TO/taxa_count_species_stats_metaphlan2.txt",
+	col.names = T, row.names = F, quote = F, sep = "\t")
+
+# Define "common" taxa as those with median > 0
+# Have also generate 25th quartile column, 
+# as this is more likely to be normally distributed 
+# (or at least less zero-inflated)
+species_common <- species_stats$Species[which(species_stats$median_count > 0)]
+
+```
+
+### Identify common taxa
+
+```{r}
+
+count_cols <- grep("BBC", colnames(taxa_count_species))
+
+taxa_count_species_common <- taxa_count_species[which(taxa_count_species$Species %in% species_common),]
+
+# Visualise the distribution
+# 31 is for QAND01 which had the lowest median
+# foo <- as.numeric(taxa_count_family_common[31,2:ncol(taxa_count_family_common)])
+# hist(foo)
+
+```
+
+### Check distribution
+
+```{r}
+
+tmp <- round(length(species_common)/5)
+dist1 <- species_common[1:tmp]
+dist2 <- species_common[(tmp+1):(2*tmp)]
+dist3 <- species_common[((2*tmp)+1):(3*tmp)]
+dist4 <- species_common[((3*tmp)+1):(4*tmp)]
+dist5 <- species_common[((4*tmp)+1):length(species_common)]
+
+taxa_count_species_common.long <- reshape2::melt(taxa_count_species_common, id.vars=c("Species"), variable.name="ID", value.name = "Read_count")
+library(plyr)
+mu <- ddply(taxa_count_species_common.long, "Species", summarise, grp.mean=mean(Read_count))
+mu1 <- mu %>% filter(Species %in% dist1)
+mu2 <- mu %>% filter(Species %in% dist2)
+mu3 <- mu %>% filter(Species %in% dist3)
+mu4 <- mu %>% filter(Species %in% dist4)
+mu5 <- mu %>% filter(Species %in% dist5)
+
+taxa_count_species_common.long1 <- taxa_count_species_common.long %>% filter(Species %in% dist1)
+taxa_count_species_common.long2 <- taxa_count_species_common.long %>% filter(Species %in% dist2)
+taxa_count_species_common.long3 <- taxa_count_species_common.long %>% filter(Species %in% dist3)
+taxa_count_species_common.long4 <- taxa_count_species_common.long %>% filter(Species %in% dist4)
+taxa_count_species_common.long5 <- taxa_count_species_common.long %>% filter(Species %in% dist5)
+
+ggplot(taxa_count_species_common.long1, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(taxa_count_species_common.long2, aes(x = Read_count, color = Species)) +
+#  geom_density() + 
+#  theme(legend.position="bottom")
+ggplot(taxa_count_species_common.long3, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(taxa_count_species_common.long4, aes(x = Read_count, color = Species)) +
+#  geom_density() + 
+#  theme(legend.position="bottom")
+ggplot(taxa_count_species_common.long5, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+taxa_count_species_common_clr <- taxa_count_species_common
+tmp <- as.matrix(taxa_count_species_common_clr[,2:ncol(taxa_count_species_common_clr)])
+taxa_count_species_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(taxa_count_species_common_clr.tmp) <- "matrix"
+
+taxa_count_species_common_clr <- data.frame(Species = taxa_count_species_common$Species, taxa_count_species_common_clr.tmp)
+
+```
+
+### Check distribution after clr transformation
+
+- Restu said should be fine to use so long as there is some centrality
+
+```{r}
+
+tmp <- round(length(species_common)/5)
+dist1 <- species_common[1:tmp]
+dist2 <- species_common[(tmp+1):(2*tmp)]
+dist3 <- species_common[((2*tmp)+1):(3*tmp)]
+dist4 <- species_common[((3*tmp)+1):(4*tmp)]
+dist5 <- species_common[((4*tmp)+1):length(species_common)]
+
+taxa_count_species_common_clr.long <- reshape2::melt(taxa_count_species_common_clr, id.vars=c("Species"), variable.name="ID", value.name = "Read_count")
+library(plyr)
+mu <- ddply(taxa_count_species_common_clr.long, "Species", summarise, grp.mean=mean(Read_count))
+mu1 <- mu %>% filter(Species %in% dist1)
+mu2 <- mu %>% filter(Species %in% dist2)
+mu3 <- mu %>% filter(Species %in% dist3)
+mu4 <- mu %>% filter(Species %in% dist4)
+mu5 <- mu %>% filter(Species %in% dist5)
+
+taxa_count_species_common_clr.long1 <- taxa_count_species_common_clr.long %>% filter(Species %in% dist1)
+taxa_count_species_common_clr.long2 <- taxa_count_species_common_clr.long %>% filter(Species %in% dist2)
+taxa_count_species_common_clr.long3 <- taxa_count_species_common_clr.long %>% filter(Species %in% dist3)
+taxa_count_species_common_clr.long4 <- taxa_count_species_common_clr.long %>% filter(Species %in% dist4)
+taxa_count_species_common_clr.long5 <- taxa_count_species_common_clr.long %>% filter(Species %in% dist5)
+
+ggplot(taxa_count_species_common_clr.long1, aes(x = Read_count, color = Species)) +
+  geom_density() +
+  theme(legend.position="bottom")
+# ggplot(taxa_count_species_common_clr.long2, aes(x = Read_count, color = Species)) +
+#  geom_density() + 
+#  theme(legend.position="bottom")
+ggplot(taxa_count_species_common_clr.long3, aes(x = Read_count, color = Species)) +
+  geom_density() + ylim(c(0,2)) +
+  theme(legend.position="bottom")
+ggplot(taxa_count_species_common_clr.long3, aes(x = Read_count, color = Species)) +
+  geom_density() +
+  theme(legend.position="bottom")
+# ggplot(taxa_count_species_common_clr.long4, aes(x = Read_count, color = Species)) +
+#  geom_density() +
+#  theme(legend.position="bottom")
+# ggplot(taxa_count_species_common_clr.long4, aes(x = Read_count, color = Species)) +
+#  geom_density() + ylim(c(0,2)) +
+#  theme(legend.position="bottom")
+ggplot(taxa_count_species_common_clr.long5, aes(x = Read_count, color = Species)) +
+  geom_density() +
+  theme(legend.position="bottom")
+ggplot(taxa_count_species_common_clr.long5, aes(x = Read_count, color = Species)) +
+  geom_density() + ylim(c(0,2))
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(taxa_count_species_common_clr$Species)
+taxa_count_species_common_clr_t <- as.data.frame(t(taxa_count_species_common_clr[,-(1)]))
+colnames(taxa_count_species_common_clr_t) <- n
+taxa_count_species_common_clr_t <- data.frame(MG_SampleID = rownames(taxa_count_species_common_clr_t), taxa_count_species_common_clr_t)
+taxa_count_species_common_clr_t <- taxa_count_species_common_clr_t[order(taxa_count_species_common_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+taxa_count_species_common_clr_t <- taxa_count_species_common_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+taxa_count_species_common_clr_t <- taxa_count_species_common_clr_t[order(match(taxa_count_species_common_clr_t$MG_SampleID,diet_full$MG_SampleID)),]
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(as.character(taxa_count_species_common_clr_t$MG_SampleID), as.character(diet_full$MG_SampleID))
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, taxa_count_species_common_clr_t[,2:ncol(taxa_count_species_common_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/taxa_count_metaphlan2species_common_clrcheck_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+
+## Take common EC level 4 variables
+
+- Enzyme commission naming system: 4 levels, with increasingly finer classification (eg. 1.1.1.1, if denoting a higher level --> 1.1.-.-)
+- Level 4 classification: n=2311 --> n=1632 after filtering for median > 0
+- Classification is based on the chemical reactions that the enzymes catalyses 
+- https://en.wikipedia.org/wiki/Enzyme_Commission_number
+
+### Subset to desired enzyme level
+
+```{r}
+
+ec <- ec_keep
+
+keep_level <- grep("[1-9].[1-9].[1-9].[1-9]", ec$VariableID)
+ec <- ec[keep_level,]
+
+```
+
+### Identify common ECs
+
+```{r}
+
+count_cols <- grep("BBC", colnames(ec))
+ec.mat <- ec[,count_cols]
+
+# Some summary statistics
+ec_stats <- data.frame(VariableID = as.character(ec$VariableID), 
+	q25_count = as.numeric(apply(ec.mat, 1, function(x) quantile(x, 0.25))),
+	median_count = as.numeric(apply(ec.mat, 1, median)),
+	mean_count = as.numeric(apply(ec.mat, 1, mean)), stringsAsFactors = FALSE)
+summary(ec_stats$median_count)
+summary(ec_stats$mean_count)
+ec_stats <- ec_stats[order(ec_stats$median_count, decreasing = TRUE),]
+
+datatable(ec_stats)
+
+write.table(ec_stats, "/PATH/TO/func_count_EClevel4_stats.txt",
+	col.names = T, row.names = F, quote = F, sep = "\t")
+
+# Define "common" taxa as those with median > 0
+# Have also generate 25th quartile column, 
+# as this is more likely to be normally distributed 
+# (or at least less zero-inflated)
+ecid_common <- ec_stats$VariableID[which(ec_stats$median_count > 0)]
+
+```
+
+```{r}
+
+count_cols <- grep("BBC", colnames(ecid_common))
+
+ec_common <- ec[which(ec$VariableID %in% ecid_common),]
+
+```
+
+### Check distribution
+
+- show a subset of EC with high median count and a subset of EC with low median count
+- observe that EC with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(ecid_common)/40)
+dist1 <- ecid_common[1:tmp]
+dist2 <- ecid_common[(tmp+1):(2*tmp)]
+dist3 <- ecid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- ecid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- ecid_common[((30*tmp)+1):(31*tmp)]
+dist6 <- ecid_common[((31*tmp)+1):(32*tmp)]
+dist7 <- ecid_common[((33*tmp)+1):(34*tmp)]
+dist8 <- ecid_common[((34*tmp)+1):(35*tmp)]
+
+ec_common.long <- reshape2::melt(ec_common, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+ec_common.long1 <- ec_common.long %>% filter(VariableID %in% dist1)
+ec_common.long2 <- ec_common.long %>% filter(VariableID %in% dist2)
+ec_common.long3 <- ec_common.long %>% filter(VariableID %in% dist3)
+ec_common.long4 <- ec_common.long %>% filter(VariableID %in% dist4)
+ec_common.long5 <- ec_common.long %>% filter(VariableID %in% dist5)
+ec_common.long6 <- ec_common.long %>% filter(VariableID %in% dist6)
+ec_common.long7 <- ec_common.long %>% filter(VariableID %in% dist7)
+ec_common.long8 <- ec_common.long %>% filter(VariableID %in% dist8)
+
+ggplot(ec_common.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(ec_common.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(ec_common.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(ec_common.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(ec_common.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(ec_common.long6, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(ec_common.long7, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(ec_common.long8, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+ec_common_clr <- ec_common
+tmp <- as.matrix(ec_common_clr[,2:ncol(ec_common_clr)])
+ec_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(ec_common_clr.tmp) <- "matrix"
+ec_common_clr <- data.frame(VariableID = ec_common$VariableID, ec_common_clr.tmp)
+
+```
+
+### Check distribution
+
+- show a subset of EC with high median count and a subset of EC with low median count
+- observe that EC with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(ecid_common)/40)
+dist1 <- ecid_common[1:tmp]
+dist2 <- ecid_common[(tmp+1):(2*tmp)]
+dist3 <- ecid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- ecid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- ecid_common[((30*tmp)+1):(31*tmp)]
+dist6 <- ecid_common[((31*tmp)+1):(32*tmp)]
+dist7 <- ecid_common[((33*tmp)+1):(34*tmp)]
+dist8 <- ecid_common[((34*tmp)+1):(35*tmp)]
+
+ec_common_clr.long <- reshape2::melt(ec_common_clr, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+ec_common_clr.long1 <- ec_common_clr.long %>% filter(VariableID %in% dist1)
+ec_common_clr.long2 <- ec_common_clr.long %>% filter(VariableID %in% dist2)
+ec_common_clr.long3 <- ec_common_clr.long %>% filter(VariableID %in% dist3)
+ec_common_clr.long4 <- ec_common_clr.long %>% filter(VariableID %in% dist4)
+ec_common_clr.long5 <- ec_common_clr.long %>% filter(VariableID %in% dist5)
+ec_common_clr.long6 <- ec_common_clr.long %>% filter(VariableID %in% dist6)
+ec_common_clr.long7 <- ec_common_clr.long %>% filter(VariableID %in% dist7)
+ec_common_clr.long8 <- ec_common_clr.long %>% filter(VariableID %in% dist8)
+
+ggplot(ec_common_clr.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+#ggplot(ec_common_clr.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(ec_common_clr.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+#ggplot(ec_common_clr.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(ec_common_clr.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+#ggplot(ec_common_clr.long6, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(ec_common_clr.long7, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(ec_common_clr.long8, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(ec_common_clr$VariableID)
+ec_common_clr_t <- as.data.frame(t(ec_common_clr[,-(1)]))
+colnames(ec_common_clr_t) <- n
+ec_common_clr_t <- data.frame(MG_SampleID = rownames(ec_common_clr_t), ec_common_clr_t)
+ec_common_clr_t <- ec_common_clr_t[order(ec_common_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+ec_common_clr_t <- ec_common_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(ec_common_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, ec_common_clr_t[,2:ncol(ec_common_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/func_count_EClevel4_common_clrcheck_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Take "rare" (but not zero) samples
+
+- ie. median < 0, but <10 non-zero samples
+- n = 510 pass filters
+
+### Subset to desired enzyme level
+
+```{r}
+
+ec <- ec_keep
+
+keep_level <- grep("[1-9].[1-9].[1-9].[1-9]", ec$VariableID)
+ec <- ec[keep_level,]
+
+```
+
+### Remove (super) zero-inflated
+
+```{r}
+
+count_cols <- grep("BBC", colnames(ec))
+
+# Filter 1: based on features across number of samples (<10 non-zero samples)
+zero_count <- unlist(lapply(1:nrow(ec), function(x) length(which(ec[x,] == 0))))
+hist(zero_count)
+zero_rm <- which(zero_count > ((ncol(ec) - 2) - 10))
+zero_rm_taxa <- ec$Taxon[zero_rm]
+
+# Filter 2: based on reads across number of samples (<100 assigned reads in at least one sample)
+maxcount_reads <- as.numeric(sapply(ec[,count_cols], max))
+zero_reads_rm <- which(maxcount_reads < 100)
+
+ec_rm0 <- ec[-zero_rm,]
+
+```
+
+### Identify rare taxa 
+
+```{r}
+
+ec_stats <- fread("/PATH/TO/func_count_EClevel4_stats.txt")
+
+ec_rare <- ec_stats$VariableID[which(ec_stats$median_count == 0)]
+
+count_cols <- grep("BBC", colnames(ec_rm0))
+
+ec_rm0_rare <- ec_rm0[which(ec_rm0$VariableID %in% ec_rare),]
+
+```
+
+### Presence/absence (0/1)
+
+- if count = 0
+
+```{r}
+
+ec_rm0_rare_01 <- ec_rm0_rare
+ec_rm0_rare_01.tmp <- apply(ec_rm0_rare_01[,2:ncol(ec_rm0_rare_01)], 2, function(x) ifelse(x != 0, 1, 0))
+ec_rm0_rare_01 <- data.frame(VariableID = ec_rm0_rare$VariableID, ec_rm0_rare_01.tmp)
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+ec_rm0_rare_clr <- ec_rm0_rare
+tmp <- as.matrix(ec_rm0_rare_clr[,2:ncol(ec_rm0_rare_clr)])
+ec_rm0_rare_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(ec_rm0_rare_clr.tmp) <- "matrix"
+
+ec_rm0_rare_clr <- data.frame(VariableID = ec_rm0_rare$VariableID, ec_rm0_rare_clr.tmp)
+
+```
+
+### Check distribution
+
+```{r}
+
+tmp <- round(length(taxa_count_species_rm0_rare_clr$Species)/10)
+dist1 <- taxa_count_species_rm0_rare_clr$Species[1:tmp]
+dist2 <- taxa_count_species_rm0_rare_clr$Species[(tmp+1):(2*tmp)]
+dist3 <- taxa_count_species_rm0_rare_clr$Species[((2*tmp)+1):(3*tmp)]
+dist4 <- taxa_count_species_rm0_rare_clr$Species[((3*tmp)+1):(4*tmp)]
+
+taxa_count_species_rm0_rare_clr.long <- reshape2::melt(taxa_count_species_rm0_rare_clr, id.vars=c("Species"), variable.name="ID", value.name = "Read_count")
+library(plyr)
+mu <- ddply(taxa_count_species_rm0_rare_clr.long, "Species", summarise, grp.mean=mean(Read_count))
+mu1 <- mu %>% filter(Species %in% dist1)
+mu2 <- mu %>% filter(Species %in% dist2)
+mu3 <- mu %>% filter(Species %in% dist3)
+mu4 <- mu %>% filter(Species %in% dist4)
+
+taxa_count_species_rm0_rare_clr.long1 <- taxa_count_species_rm0_rare_clr.long %>% filter(Species %in% dist1)
+taxa_count_species_rm0_rare_clr.long2 <- taxa_count_species_rm0_rare_clr.long %>% filter(Species %in% dist2)
+taxa_count_species_rm0_rare_clr.long3 <- taxa_count_species_rm0_rare_clr.long %>% filter(Species %in% dist3)
+taxa_count_species_rm0_rare_clr.long4 <- taxa_count_species_rm0_rare_clr.long %>% filter(Species %in% dist4)
+
+ggplot(taxa_count_species_rm0_rare_clr.long1, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(taxa_count_species_rm0_rare_clr.long2, aes(x = Read_count, color = Species)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+# ggplot(taxa_count_species_rm0_rare_clr.long3, aes(x = Read_count, color = Species)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(taxa_count_species_rm0_rare_clr.long4, aes(x = Read_count, color = Species)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(ec_rm0_rare_clr$VariableID)
+ec_rm0_rare_clr_t <- as.data.frame(t(ec_rm0_rare_clr[,-(1)]))
+colnames(ec_rm0_rare_clr_t) <- n
+ec_rm0_rare_clr_t <- data.frame(MG_SampleID = rownames(ec_rm0_rare_clr_t), ec_rm0_rare_clr_t)
+ec_rm0_rare_clr_t <- ec_rm0_rare_clr_t[order(ec_rm0_rare_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+```{r}
+
+# Read counts, keep 0s
+n <- as.character(ec_rm0_rare_01$VariableID)
+ec_rm0_rare_01_t <- as.data.frame(t(ec_rm0_rare_01[,-(1)]))
+colnames(ec_rm0_rare_01_t) <- n
+ec_rm0_rare_01_t <- data.frame(MG_SampleID = rownames(ec_rm0_rare_01_t), ec_rm0_rare_01_t)
+ec_rm0_rare_01_t <- ec_rm0_rare_01_t[order(ec_rm0_rare_01_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+ec_rm0_rare_clr_t <- ec_rm0_rare_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+ec_rm0_rare_01_t <- ec_rm0_rare_01_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(ec_rm0_rare_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, ec_rm0_rare_clr_t[,2:ncol(ec_rm0_rare_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/func_count_EClevel4_rm0_rare_clrcheck_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+```{r}
+
+# 1. Matrix
+identical(ec_rm0_rare_01_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, ec_rm0_rare_01_t[,2:ncol(ec_rm0_rare_01_t)])
+write.table(osca_out, "/PATH/TO/osca/func_count_EClevel4_rm0_rare_01_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Take common EC level 3 variables
+
+- Enzyme commission naming system: 4 levels, with increasingly finer classification (eg. 1.1.1.1, if denoting a higher level --> 1.1.-.-)
+- Level 3 classification: n=98 --> n=88 after filtering for median > 0
+- Classification is based on the chemical reactions that the enzymes catalyses 
+- https://en.wikipedia.org/wiki/Enzyme_Commission_number
+
+### Subset to desired enzyme level
+
+```{r}
+
+ec <- ec_keep
+
+keep_level <- grep("[1-9].[1-9].[1-9].-", ec$VariableID)
+ec <- ec[keep_level,]
+
+```
+
+### Identify common ECs
+
+```{r}
+
+count_cols <- grep("BBC", colnames(ec))
+ec.mat <- ec[,count_cols]
+
+# Some summary statistics
+ec_stats <- data.frame(VariableID = as.character(ec$VariableID), 
+	q25_count = as.numeric(apply(ec.mat, 1, function(x) quantile(x, 0.25))),
+	median_count = as.numeric(apply(ec.mat, 1, median)),
+	mean_count = as.numeric(apply(ec.mat, 1, mean)), stringsAsFactors = FALSE)
+summary(ec_stats$median_count)
+summary(ec_stats$mean_count)
+ec_stats <- ec_stats[order(ec_stats$median_count, decreasing = TRUE),]
+
+datatable(ec_stats)
+
+write.table(ec_stats, "/PATH/TO/func_count_EClevel3_stats.txt",
+	col.names = T, row.names = F, quote = F, sep = "\t")
+
+# Define "common" taxa as those with median > 0
+# Have also generate 25th quartile column, 
+# as this is more likely to be normally distributed 
+# (or at least less zero-inflated)
+ecid_common <- ec_stats$VariableID[which(ec_stats$median_count > 0)]
+
+```
+
+```{r}
+
+count_cols <- grep("BBC", colnames(ecid_common))
+
+ec_common <- ec[which(ec$VariableID %in% ecid_common),]
+
+```
+
+### Check distribution
+
+- show a subset of EC with high median count and a subset of EC with low median count
+- observe that EC with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(ecid_common)/5)
+dist1 <- ecid_common[1:tmp]
+dist2 <- ecid_common[(tmp+1):(2*tmp)]
+dist3 <- ecid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- ecid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- ecid_common[((3*tmp)+1):(5*tmp)]
+
+ec_common.long <- reshape2::melt(ec_common, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+ec_common.long1 <- ec_common.long %>% filter(VariableID %in% dist1)
+ec_common.long2 <- ec_common.long %>% filter(VariableID %in% dist2)
+ec_common.long3 <- ec_common.long %>% filter(VariableID %in% dist3)
+ec_common.long4 <- ec_common.long %>% filter(VariableID %in% dist4)
+ec_common.long5 <- ec_common.long %>% filter(VariableID %in% dist5)
+
+ggplot(ec_common.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(ec_common.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(ec_common.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(ec_common.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(ec_common.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+ec_common_clr <- ec_common
+tmp <- as.matrix(ec_common_clr[,2:ncol(ec_common_clr)])
+ec_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(ec_common_clr.tmp) <- "matrix"
+
+ec_common_clr <- data.frame(VariableID = ec_common_clr$VariableID, ec_common_clr.tmp)
+
+```
+
+### Check distribution
+
+- show a subset of EC with high median count and a subset of EC with low median count
+- observe that EC with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(ecid_common)/5)
+dist1 <- ecid_common[1:tmp]
+dist2 <- ecid_common[(tmp+1):(2*tmp)]
+dist3 <- ecid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- ecid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- ecid_common[((4*tmp)+1):(5*tmp)]
+
+ec_common_clr.long <- reshape2::melt(ec_common_clr, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+ec_common_clr.long1 <- ec_common_clr.long %>% filter(VariableID %in% dist1)
+ec_common_clr.long2 <- ec_common_clr.long %>% filter(VariableID %in% dist2)
+ec_common_clr.long3 <- ec_common_clr.long %>% filter(VariableID %in% dist3)
+ec_common_clr.long4 <- ec_common_clr.long %>% filter(VariableID %in% dist4)
+ec_common_clr.long5 <- ec_common_clr.long %>% filter(VariableID %in% dist5)
+
+ggplot(ec_common_clr.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(ec_common_clr.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(ec_common_clr.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(ec_common_clr.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(ec_common_clr.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(ec_common_clr$VariableID)
+ec_common_clr_t <- as.data.frame(t(ec_common_clr[,-(1)]))
+colnames(ec_common_clr_t) <- n
+ec_common_clr_t <- data.frame(MG_SampleID = rownames(ec_common_clr_t), ec_common_clr_t)
+ec_common_clr_t <- ec_common_clr_t[order(ec_common_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+ec_common_clr_t <- ec_common_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(ec_common_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, ec_common_clr_t[,2:ncol(ec_common_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/func_count_EClevel3_common_clrcheck_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Take TCDB
+
+- "The TC system consists of a set of representative protein sequences, most of which have been functionally characterized. These transporters are classified with a five-character designation, as follows: D1.L1.D2.D3.D4. D1 (a single digit) corresponds to the transporter class (i.e. channel, carrier, primary active transporter, group translocator or transmembrane electron flow carrier). L1 (a letter) corresponds to the transporter subclass, which, e.g. in the case of primary active transporters, refers to the energy source used to drive transport. D2 (a number) corresponds to the transporter family (sometimes actually a superfamily). D3 (a number) corresponds to the subfamily (or the family of a superfamily) in which a transporter is found. D4 (a number) corresponds to the transporter itself. This refers to a specific transport system with a defined range of substrates, a known polarity of transport, an energy source that drives vectorial movement of the substrate and a mechanism of action. Only in one of the TC classes (class 9) is this information incomplete or absent." https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1334385/
+- All TCDB families in this dataset go to 5 levels of classes --> no need to subset as far as I can see
+
+### Keep all (as all have 5 levels of hierarchy)
+
+```{r}
+
+tcdb <- tcdb_keep
+
+```
+
+### Identify common TCDB variables
+
+```{r}
+
+count_cols <- grep("BBC", colnames(tcdb))
+tcdb.mat <- tcdb[,count_cols]
+
+# Some summary statistics
+tcdb_stats <- data.frame(VariableID = as.character(tcdb$VariableID), 
+	q25_count = as.numeric(apply(tcdb.mat, 1, function(x) quantile(x, 0.25))),
+	median_count = as.numeric(apply(tcdb.mat, 1, median)),
+	mean_count = as.numeric(apply(tcdb.mat, 1, mean)), stringsAsFactors = FALSE)
+summary(tcdb_stats$median_count)
+summary(tcdb_stats$mean_count)
+tcdb_stats <- tcdb_stats[order(tcdb_stats$median_count, decreasing = TRUE),]
+
+datatable(tcdb_stats)
+
+write.table(tcdb_stats, "/PATH/TO/func_count_TCDB_stats.txt",
+	col.names = T, row.names = F, quote = F, sep = "\t")
+
+# Define "common" taxa as those with median > 0
+# Have also generate 25th quartile column, 
+# as this is more likely to be normally distributed 
+# (or at least less zero-inflated)
+tcdbid_common <- tcdb_stats$VariableID[which(tcdb_stats$median_count > 0)]
+
+```
+
+```{r}
+
+count_cols <- grep("BBC", colnames(tcdb))
+
+tcdb_common <- tcdb[which(tcdb$VariableID %in% tcdbid_common),]
+
+```
+
+### Check distribution
+
+- show a subset of TCDB with high median count and a subset of EC with low median count
+- observe that TCDB with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(tcdbid_common)/30)
+dist1 <- tcdbid_common[1:tmp]
+dist2 <- tcdbid_common[(tmp+1):(2*tmp)]
+dist3 <- tcdbid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- tcdbid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- tcdbid_common[((4*tmp)+1):(5*tmp)]
+
+tcdb_common.long <- reshape2::melt(tcdb_common, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+tcdb_common.long1 <- tcdb_common.long %>% filter(VariableID %in% dist1)
+tcdb_common.long2 <- tcdb_common.long %>% filter(VariableID %in% dist2)
+tcdb_common.long3 <- tcdb_common.long %>% filter(VariableID %in% dist3)
+tcdb_common.long4 <- tcdb_common.long %>% filter(VariableID %in% dist4)
+tcdb_common.long5 <- tcdb_common.long %>% filter(VariableID %in% dist5)
+
+ggplot(tcdb_common.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(tcdb_common.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(tcdb_common.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(tcdb_common.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(tcdb_common.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+tcdb_common_clr <- tcdb_common
+tmp <- as.matrix(tcdb_common_clr[,2:ncol(tcdb_common_clr)])
+tcdb_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(tcdb_common_clr.tmp) <- "matrix"
+
+tcdb_common_clr <- data.frame(VariableID = tcdb_common_clr$VariableID, tcdb_common_clr.tmp)
+
+```
+
+### Check distribution
+
+- show a subset of EC with high median count and a subset of EC with low median count
+- observe that EC with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(tcdbid_common)/30)
+dist1 <- tcdbid_common[1:tmp]
+dist2 <- tcdbid_common[(tmp+1):(2*tmp)]
+dist3 <- tcdbid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- tcdbid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- tcdbid_common[((4*tmp)+1):(5*tmp)]
+
+tcdb_common_clr.long <- reshape2::melt(tcdb_common_clr, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+tcdb_common_clr.long1 <- tcdb_common_clr.long %>% filter(VariableID %in% dist1)
+tcdb_common_clr.long2 <- tcdb_common_clr.long %>% filter(VariableID %in% dist2)
+tcdb_common_clr.long3 <- tcdb_common_clr.long %>% filter(VariableID %in% dist3)
+tcdb_common_clr.long4 <- tcdb_common_clr.long %>% filter(VariableID %in% dist4)
+tcdb_common_clr.long5 <- tcdb_common_clr.long %>% filter(VariableID %in% dist5)
+
+ggplot(tcdb_common_clr.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(tcdb_common_clr.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(tcdb_common_clr.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(tcdb_common_clr.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(tcdb_common_clr.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(tcdb_common_clr$VariableID)
+tcdb_common_clr_t <- as.data.frame(t(tcdb_common_clr[,-(1)]))
+colnames(tcdb_common_clr_t) <- n
+tcdb_common_clr_t <- data.frame(MG_SampleID = rownames(tcdb_common_clr_t), tcdb_common_clr_t)
+tcdb_common_clr_t <- tcdb_common_clr_t[order(tcdb_common_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+tcdb_common_clr_t <- tcdb_common_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(tcdb_common_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, tcdb_common_clr_t[,2:ncol(tcdb_common_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/func_count_TCDB_common_clrcheck_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Take MetaCyc Pathways
+
+- start with 2871 pathways
+- common pathways (median > 0): n = 795
+
+### Keep all (as within pathway "units")
+
+```{r}
+
+mcpath <- mcpath_keep
+
+```
+
+### Identify common MetaCyc variables
+
+```{r}
+
+count_cols <- grep("BBC", colnames(mcpath))
+mcpath.mat <- mcpath[,count_cols]
+
+# Some summary statistics
+mcpath_stats <- data.frame(VariableID = as.character(mcpath$VariableID), 
+	q25_count = as.numeric(apply(mcpath.mat, 1, function(x) quantile(x, 0.25))),
+	median_count = as.numeric(apply(mcpath.mat, 1, median)),
+	mean_count = as.numeric(apply(mcpath.mat, 1, mean)), stringsAsFactors = FALSE)
+summary(mcpath_stats$median_count)
+summary(mcpath_stats$mean_count)
+mcpath_stats <- mcpath_stats[order(mcpath_stats$median_count, decreasing = TRUE),]
+
+datatable(mcpath_stats)
+
+write.table(mcpath_stats, "/Users/uqcyap3/Documents/Research/ASD/Data/3_metagenomics/func_count_MetaCycpathway_stats.txt",
+	col.names = T, row.names = F, quote = F, sep = "\t")
+
+# Define "common" taxa as those with median > 0
+# Have also generate 25th quartile column, 
+# as this is more likely to be normally distributed 
+# (or at least less zero-inflated)
+mcpathid_common <- mcpath_stats$VariableID[which(mcpath_stats$median_count > 0)]
+
+```
+
+```{r}
+
+count_cols <- grep("BBC", colnames(mcpath))
+
+mcpath_common <- mcpath[which(mcpath$VariableID %in% mcpathid_common),]
+
+```
+
+### Check distribution
+
+- show a subset of MetaCyc Pathways with high median count and a subset of EC with low median count
+- observe that MetaCyc Pathways with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(mcpathid_common)/30)
+dist1 <- mcpathid_common[1:tmp]
+dist2 <- mcpathid_common[(tmp+1):(2*tmp)]
+dist3 <- mcpathid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- mcpathid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- mcpathid_common[((4*tmp)+1):(5*tmp)]
+
+mcpath_common.long <- reshape2::melt(mcpath_common, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+mcpath_common.long1 <- mcpath_common.long %>% filter(VariableID %in% dist1)
+mcpath_common.long2 <- mcpath_common.long %>% filter(VariableID %in% dist2)
+mcpath_common.long3 <- mcpath_common.long %>% filter(VariableID %in% dist3)
+mcpath_common.long4 <- mcpath_common.long %>% filter(VariableID %in% dist4)
+mcpath_common.long5 <- mcpath_common.long %>% filter(VariableID %in% dist5)
+
+ggplot(mcpath_common.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(mcpath_common.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(mcpath_common.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+mcpath_common_clr <- mcpath_common
+tmp <- as.matrix(mcpath_common_clr[,2:ncol(mcpath_common_clr)])
+mcpath_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(mcpath_common_clr.tmp) <- "matrix"
+
+mcpath_common_clr <- data.frame(VariableID = mcpath_common_clr$VariableID, mcpath_common_clr.tmp)
+
+```
+
+### Check distribution
+
+- show a subset of EC with high median count and a subset of EC with low median count
+- observe that EC with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(mcpathid_common)/30)
+dist1 <- mcpathid_common[1:tmp]
+dist2 <- mcpathid_common[(tmp+1):(2*tmp)]
+dist3 <- mcpathid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- mcpathid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- mcpathid_common[((4*tmp)+1):(5*tmp)]
+
+mcpath_common_clr.long <- reshape2::melt(mcpath_common_clr, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+mcpath_common_clr.long1 <- mcpath_common_clr.long %>% filter(VariableID %in% dist1)
+mcpath_common_clr.long2 <- mcpath_common_clr.long %>% filter(VariableID %in% dist2)
+mcpath_common_clr.long3 <- mcpath_common_clr.long %>% filter(VariableID %in% dist3)
+mcpath_common_clr.long4 <- mcpath_common_clr.long %>% filter(VariableID %in% dist4)
+mcpath_common_clr.long5 <- mcpath_common_clr.long %>% filter(VariableID %in% dist5)
+
+ggplot(mcpath_common_clr.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common_clr.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(mcpath_common_clr.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common_clr.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(mcpath_common_clr.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(mcpath_common_clr$VariableID)
+mcpath_common_clr_t <- as.data.frame(t(mcpath_common_clr[,-(1)]))
+colnames(mcpath_common_clr_t) <- n
+mcpath_common_clr_t <- data.frame(MG_SampleID = rownames(mcpath_common_clr_t), mcpath_common_clr_t)
+mcpath_common_clr_t <- mcpath_common_clr_t[order(mcpath_common_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+mcpath_common_clr_t <- mcpath_common_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(mcpath_common_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, mcpath_common_clr_t[,2:ncol(mcpath_common_clr_t)])
+write.table(osca_out, "/Volumes/YAPASD-Q0851/uqcyap3/ASD/Data/3_metagenomics/osca/func_count_MetaCycpathway_common_clrcheck_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Take Microba gene functional tables
+
+- start with 3001133 pathways
+- common pathways (median > 0): n = 232442
+
+### Keep all (as within pathway "units")
+
+```{r}
+
+func <- func_keep
+
+```
+
+### Identify common functional variables
+
+```{r}
+
+count_cols <- grep("BBC", colnames(func))
+func.mat <- func[,count_cols]
+
+# Some summary statistics
+func_stats <- data.frame(VariableID = as.character(func$VariableID), 
+	q25_count = as.numeric(apply(func.mat, 1, function(x) quantile(x, 0.25))),
+	median_count = as.numeric(apply(func.mat, 1, median)),
+	mean_count = as.numeric(apply(func.mat, 1, mean)), stringsAsFactors = FALSE)
+summary(func_stats$median_count)
+summary(func_stats$mean_count)
+func_stats <- func_stats[order(func_stats$median_count, decreasing = TRUE),]
+
+datatable(func_stats)
+
+write.table(func_stats, "/PATH/TO/func_count_Microba_stats.txt",
+	col.names = T, row.names = F, quote = F, sep = "\t")
+
+```
+
+```{r}
+
+func_stats <- read.delim("/PATH/TO/func_count_Microba_stats.txt", header = T, as.is = T)
+
+# Define "common" taxa as those with median > 0
+# Have also generate 25th quartile column, 
+# as this is more likely to be normally distributed 
+# (or at least less zero-inflated)
+funcid_common <- func_stats$VariableID[which(func_stats$median_count > 0)]
+
+```
+
+```{r}
+
+count_cols <- grep("BBC", colnames(func))
+
+func_common <- func[which(func$VariableID %in% funcid_common),]
+
+```
+
+### Check distribution
+
+- show a subset of microbial genes with high median count and a subset of EC with low median count
+- observe that microbial genes with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(funcid_common)/30)
+dist1 <- funcid_common[1:tmp]
+dist2 <- funcid_common[(tmp+1):(2*tmp)]
+dist3 <- funcid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- funcid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- funcid_common[((4*tmp)+1):(5*tmp)]
+
+func_common.long <- reshape2::melt(func_common, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+func_common.long1 <- func_common.long %>% filter(VariableID %in% dist1)
+func_common.long2 <- func_common.long %>% filter(VariableID %in% dist2)
+func_common.long3 <- func_common.long %>% filter(VariableID %in% dist3)
+func_common.long4 <- func_common.long %>% filter(VariableID %in% dist4)
+func_common.long5 <- func_common.long %>% filter(VariableID %in% dist5)
+
+ggplot(func_common.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(func_common.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(func_common.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+func_common_clr <- func_common
+tmp <- as.matrix(func_common_clr[,2:ncol(func_common_clr)])
+func_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(func_common_clr.tmp) <- "matrix"
+
+func_common_clr <- data.frame(VariableID = func_common_clr$VariableID, func_common_clr.tmp)
+
+```
+
+### Check distribution
+
+- show a subset of Microba genes with high median count and a subset with low median count
+- observe that Microba genes with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(mcpathid_common)/30)
+dist1 <- funcid_common[1:tmp]
+dist2 <- funcid_common[(tmp+1):(2*tmp)]
+dist3 <- funcid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- funcid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- funcid_common[((4*tmp)+1):(5*tmp)]
+
+func_common_clr.long <- reshape2::melt(func_common_clr, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+func_common_clr.long1 <- func_common_clr.long %>% filter(VariableID %in% dist1)
+func_common_clr.long2 <- func_common_clr.long %>% filter(VariableID %in% dist2)
+func_common_clr.long3 <- func_common_clr.long %>% filter(VariableID %in% dist3)
+func_common_clr.long4 <- func_common_clr.long %>% filter(VariableID %in% dist4)
+func_common_clr.long5 <- func_common_clr.long %>% filter(VariableID %in% dist5)
+
+ggplot(func_common_clr.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common_clr.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(func_common_clr.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common_clr.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(func_common_clr.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(func_common_clr$VariableID)
+func_common_clr_t <- as.data.frame(t(func_common_clr[,-(1)]))
+colnames(func_common_clr_t) <- n
+func_common_clr_t <- data.frame(MG_SampleID = rownames(func_common_clr_t), func_common_clr_t)
+func_common_clr_t <- func_common_clr_t[order(func_common_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+func_common_clr_t <- func_common_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(func_common_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, func_common_clr_t[,2:ncol(func_common_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/func_count_Microba_common_clrcheck_t.tsv", col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Take "rare" (but not zero) samples
+
+- ie. median < 0, but <10 non-zero samples
+- n = 1160311 pass filters
+
+### Identify rare taxa 
+
+```{r}
+
+func_stats <- fread("/PATH/TO/func_count_Microba_stats.txt")
+
+func_rare <- func_stats$VariableID[which(func_stats$median_count == 0)]
+
+count_cols <- grep("BBC", colnames(func))
+
+func_rare <- func[which(func$VariableID %in% func_rare),]
+
+```
+
+
+### Remove (super) zero-inflated
+
+```{r}
+
+count_cols <- grep("BBC", colnames(func_rare))
+
+# Filter 1: based on features across number of samples (<10 non-zero samples)
+zero_count <- unlist(lapply(1:nrow(func_rare), function(x) length(which(func_rare[x,] == 0))))
+hist(zero_count)
+zero_rm <- which(zero_count > ((ncol(func_rare) - 2) - 10))
+zero_rm_taxa <- func_rare$VariableID[zero_rm]
+
+# Filter 2: based on reads across number of samples (<100 assigned reads in at least one sample)
+# - this filter is not relevant to functional data
+# maxcount_reads <- as.numeric(sapply(func_rare[,count_cols], max))
+# zero_reads_rm <- which(maxcount_reads < 100)
+
+func_rm0_rare <- func_rare[-zero_rm,]
+
+```
+
+### Presence/absence (0/1)
+
+- if count = 0
+
+```{r}
+
+func_rm0_rare_01 <- func_rm0_rare
+func_rm0_rare_01.tmp <- apply(func_rm0_rare_01[,2:ncol(func_rm0_rare_01)], 2, function(x) ifelse(x != 0, 1, 0))
+func_rm0_rare_01 <- data.frame(VariableID = func_rm0_rare$VariableID, func_rm0_rare_01.tmp)
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+func_rm0_rare_clr <- func_rm0_rare
+tmp <- as.matrix(func_rm0_rare_clr[,2:ncol(func_rm0_rare_clr)])
+func_rm0_rare_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(func_rm0_rare_clr.tmp) <- "matrix"
+
+func_rm0_rare_clr <- data.frame(VariableID = func_rm0_rare_clr$VariableID, func_rm0_rare_clr.tmp)
+
+```
+
+### Check distribution
+
+- left out to reduce memory/time requirements
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(func_rm0_rare_clr$VariableID)
+func_rm0_rare_clr_t <- as.data.frame(t(func_rm0_rare_clr[,-(1)]))
+colnames(func_rm0_rare_clr_t) <- n
+func_rm0_rare_clr_t <- data.frame(MG_SampleID = rownames(func_rm0_rare_clr_t), func_rm0_rare_clr_t)
+func_rm0_rare_clr_t <- func_rm0_rare_clr_t[order(func_rm0_rare_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+```{r}
+
+# Read counts, keep 0s
+n <- as.character(func_rm0_rare_01$VariableID)
+func_rm0_rare_01_t <- as.data.frame(t(func_rm0_rare_01[,-(1)]))
+colnames(func_rm0_rare_01_t) <- n
+func_rm0_rare_01_t <- data.frame(MG_SampleID = rownames(func_rm0_rare_01_t), func_rm0_rare_01_t)
+func_rm0_rare_01_t <- func_rm0_rare_01_t[order(func_rm0_rare_01_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+func_rm0_rare_clr_t <- func_rm0_rare_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+```{r}
+
+func_rm0_rare_01_t <- func_rm0_rare_01_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(func_rm0_rare_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, func_rm0_rare_clr_t[,2:ncol(func_rm0_rare_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/func_count_Microba_rm0_rare_clrcheck_t.tsv", col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+```{r}
+
+# 1. Matrix
+identical(func_rm0_rare_01_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, func_rm0_rare_01_t[,2:ncol(func_rm0_rare_01_t)])
+write.table(osca_out, "/PATH/TO/osca/func_count_Microba_rm0_rare_01_t.tsv", 	col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Take HuMAnN2 gene functional tables
+
+### Keep all (as within pathway "units")
+
+```{r}
+
+func <- humann2
+
+```
+
+### Identify common functional variables
+
+```{r}
+
+count_cols <- grep("BBC", colnames(func))
+func.mat <- func[,count_cols]
+
+# Some summary statistics
+func_stats <- data.frame(VariableID = as.character(func$VariableID), 
+	q25_count = as.numeric(apply(func.mat, 1, function(x) quantile(x, 0.25))),
+	median_count = as.numeric(apply(func.mat, 1, median)),
+	mean_count = as.numeric(apply(func.mat, 1, mean)), stringsAsFactors = FALSE)
+summary(func_stats$median_count)
+summary(func_stats$mean_count)
+func_stats <- func_stats[order(func_stats$median_count, decreasing = TRUE),]
+
+datatable(func_stats)
+
+write.table(func_stats, "/PATH/TO/func_count_humann2_stats.txt",
+	col.names = T, row.names = F, quote = F, sep = "\t")
+
+```
+
+```{r}
+
+func_stats <- read.delim("/PATH/TO/func_count_humann2_stats.txt", header = T, as.is = T)
+
+# Define "common" taxa as those with median > 0
+# Have also generate 25th quartile column, 
+# as this is more likely to be normally distributed 
+# (or at least less zero-inflated)
+funcid_common <- func_stats$VariableID[which(func_stats$median_count > 0)]
+
+```
+
+```{r}
+
+count_cols <- grep("BBC", colnames(func))
+
+func_common <- func[which(func$VariableID %in% funcid_common),]
+
+```
+
+### Check distribution
+
+- show a subset of microbial genes with high median count and a subset of EC with low median count
+- observe that microbial genes with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(funcid_common)/30)
+dist1 <- funcid_common[1:tmp]
+dist2 <- funcid_common[(tmp+1):(2*tmp)]
+dist3 <- funcid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- funcid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- funcid_common[((4*tmp)+1):(5*tmp)]
+
+func_common.long <- reshape2::melt(func_common, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+func_common.long1 <- func_common.long %>% filter(VariableID %in% dist1)
+func_common.long2 <- func_common.long %>% filter(VariableID %in% dist2)
+func_common.long3 <- func_common.long %>% filter(VariableID %in% dist3)
+func_common.long4 <- func_common.long %>% filter(VariableID %in% dist4)
+func_common.long5 <- func_common.long %>% filter(VariableID %in% dist5)
+
+ggplot(func_common.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(func_common.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(func_common.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### clr transformation
+
+```{r}
+
+# Perform clr
+func_common_clr <- func_common
+tmp <- as.matrix(func_common_clr[,2:ncol(func_common_clr)])
+func_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+class(func_common_clr.tmp) <- "matrix"
+
+func_common_clr <- data.frame(VariableID = func_common_clr$VariableID, func_common_clr.tmp)
+
+```
+
+### Check distribution
+
+- show a subset of Microba genes with high median count and a subset with low median count
+- observe that Microba genes with higher median count --> more normal distribution
+
+```{r}
+
+tmp <- round(length(mcpathid_common)/30)
+dist1 <- funcid_common[1:tmp]
+dist2 <- funcid_common[(tmp+1):(2*tmp)]
+dist3 <- funcid_common[((2*tmp)+1):(3*tmp)]
+dist4 <- funcid_common[((3*tmp)+1):(4*tmp)]
+dist5 <- funcid_common[((4*tmp)+1):(5*tmp)]
+
+func_common_clr.long <- reshape2::melt(func_common_clr, id.vars=c("VariableID"), variable.name="ID", value.name = "Read_count")
+
+func_common_clr.long1 <- func_common_clr.long %>% filter(VariableID %in% dist1)
+func_common_clr.long2 <- func_common_clr.long %>% filter(VariableID %in% dist2)
+func_common_clr.long3 <- func_common_clr.long %>% filter(VariableID %in% dist3)
+func_common_clr.long4 <- func_common_clr.long %>% filter(VariableID %in% dist4)
+func_common_clr.long5 <- func_common_clr.long %>% filter(VariableID %in% dist5)
+
+ggplot(func_common_clr.long1, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common_clr.long2, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(func_common_clr.long3, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+# ggplot(mcpath_common_clr.long4, aes(x = Read_count, color = VariableID)) +
+#   geom_density() + 
+#   theme(legend.position="bottom")
+ggplot(func_common_clr.long5, aes(x = Read_count, color = VariableID)) +
+  geom_density() + 
+  theme(legend.position="bottom")
+
+```
+
+### Pre-OSCA data cleaning
+
+#### Transpose the matrix for OSCA (input: taxa by columns)
+
+```{r}
+
+# Read counts, keep 0s non-clr dataframe
+n <- as.character(func_common_clr$VariableID)
+func_common_clr_t <- as.data.frame(t(func_common_clr[,-(1)]))
+colnames(func_common_clr_t) <- n
+func_common_clr_t <- data.frame(MG_SampleID = rownames(func_common_clr_t), func_common_clr_t)
+func_common_clr_t <- func_common_clr_t[order(func_common_clr_t$MG_SampleID),] # sort to be sure to avoid mix-ups
+
+```
+
+#### Subset to individuals with dietary data
+
+```{r}
+
+func_common_clr_t <- func_common_clr_t %>% filter(MG_SampleID %in% diet_full$MG_SampleID)
+
+```
+
+### Generate microbiome matrix for OSCA
+
+```{r}
+
+# 1. Matrix
+identical(func_common_clr_t$MG_SampleID, diet_full$MG_SampleID)
+osca_out <- data.table(FID = diet_full$IID, IID = diet_full$IID, func_common_clr_t[,2:ncol(func_common_clr_t)])
+write.table(osca_out, "/PATH/TO/osca/func_count_humann2_common_clrcheck_t.tsv", col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
+## Generate other outputs for OSCA
+
+### 1. Case-control analysis: pheno + covariate files
+
+- pheno: case/control
+- cov: create both with and without bristol stool chart
+- qcov: create both with and without dietary PCs
+
+```{r}
+
+pheno <- diet_full[,c("IID", "IID", "ASD", "bmi", "bristol_stool_chart_regroup", "sleep_cshq_total", "devq_wisc_msel")]
+pheno$ASD <- ifelse(pheno$ASD == "ASD", 1, 0)
+colnames(pheno)[1:2] <- c("FID", "IID")
+cov <- diet_full[,c("IID", "IID", "proforma_sex")]
+qcov <- diet_full[,c("IID", "IID", "age", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "bristol_stool_chart_regroup")]
+# Pheno adjusted for proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe (logistic regression)
+pheno_resid <- glm(pheno$ASD ~ proforma_sex + age + PC1_diet_pe + PC2_diet_pe + PC3_diet_pe, data = diet_full, family = "binomial")
+summary(pheno_resid)
+pheno$ASD_adjsexagediet <- residuals(pheno_resid)
+
+# Raw pheno
+write.table(pheno %>% dplyr::select(c("FID", "IID", "ASD")), 
+	"/PATH/TO/osca_metagenomics_casecontrol.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+write.table(pheno %>% dplyr::select(c("FID", "IID", "ASD_adjsexagediet")), 
+	"/PATH/TO/osca_metagenomics_casecontrol_resid_sex_age_dietPC.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+write.table(pheno %>% dplyr::select(c("FID", "IID", "bristol_stool_chart_regroup")), 
+	"/PATH/TO/osca_metagenomics_bristol.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+write.table(pheno %>% dplyr::select(c("FID", "IID", "bmi")), 
+	"/PATH/TO/osca_metagenomics_bmi.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+write.table(pheno %>% dplyr::select(c("FID", "IID", "sleep_cshq_total")), 
+	"/PATH/TO/osca_metagenomics_sleep_cshq_total.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+write.table(pheno %>% dplyr::select(c("FID", "IID", "devq_wisc_msel")), 
+	"/PATH/TO/osca_metagenomics_devq_wisc_msel.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+
+# Discrete covariates
+write.table(cov, 
+	"/PATH/TO/osca_metagenomics_sex.cov",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+
+# Continuous covariates
+write.table(qcov, 
+	"/PATH/TO/osca_metagenomics_age_dietPC_bristol.qcov",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+write.table(qcov %>% dplyr::select(-c("bristol_stool_chart_regroup")), 
+	"/PATH/TO/osca_metagenomics_age_dietPC.qcov",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+write.table(qcov %>% dplyr::select(-c("PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe", "bristol_stool_chart_regroup")), 
+	"/PATH/TO/osca_metagenomics_age.qcov",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+
+```
+
+### 2. Diet analysis (take PCs as the phenotype): pheno + covariate files
+
+```{r}
+
+pheno_diet <- diet_full[,c("IID", "IID", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe")]
+cov <- diet_full[,c("IID", "IID", "proforma_sex", "participant_type")]
+# PC1 - regress out covariates
+pheno_resid <- lm(pheno_diet$PC1_diet_pe ~ cov$proforma_sex + cov$participant_type + qcov$age)
+summary(pheno_resid)
+pheno_diet$PC1_adjsexagegroup <- residuals(pheno_resid)
+# PC2 - regress out covariates
+pheno_resid <- lm(pheno_diet$PC2_diet_pe ~ cov$proforma_sex + cov$participant_type + qcov$age)
+summary(pheno_resid)
+pheno_diet$PC2_adjsexagegroup <- residuals(pheno_resid)
+# PC3 - regress out covariates
+pheno_resid <- lm(pheno_diet$PC3_diet_pe ~ cov$proforma_sex + cov$participant_type + qcov$age)
+summary(pheno_resid)
+pheno_diet$PC3_adjsexagegroup <- residuals(pheno_resid)
+
+# Pheno - raw
+write.table(pheno_diet %>% dplyr::select(c("IID", "IID.1", "PC1_diet_pe")), 
+	"/PATH/TO/osca_metagenomics_dietPC1.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+write.table(pheno_diet %>% dplyr::select(c("IID", "IID.1", "PC2_diet_pe")), 
+	"/PATH/TO/osca_metagenomics_dietPC2.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+write.table(pheno_diet %>% dplyr::select(c("IID", "IID.1", "PC3_diet_pe")), 
+	"/PATH/TO/osca_metagenomics_dietPC3.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+
+# Pheno - adjusted
+write.table(pheno_diet %>% dplyr::select(c("IID", "IID.1", "PC1_adjsexagegroup")), 
+	"/PATH/TO/osca_metagenomics_dietPC1_preadj.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+write.table(pheno_diet %>% dplyr::select(c("IID", "IID.1", "PC2_adjsexagegroup")), 
+	"/PATH/TO/osca_metagenomics_dietPC2_preadj.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+write.table(pheno_diet %>% dplyr::select(c("IID", "IID.1", "PC3_adjsexagegroup")), 
+	"/PATH/TO/osca_metagenomics_dietPC3_preadj.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+
+# Discrete covariates
+write.table(cov, 
+	"/PATH/TO/osca_metagenomics_sex_group.cov",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+
+```
+
+### 3. Bristol Stool Chart analysis
+
+```{r}
+
+bristol <- diet_full %>% filter(!(is.na(bristol_stool_chart_regroup)))
+pheno_bss <- bristol[,c("IID", "IID", "bristol_stool_chart_regroup")]
+cov <- bristol[,c("IID", "IID", "proforma_sex", "participant_type")]
+qcov <- bristol[,c("IID", "IID", "age", "PC1_diet_pe", "PC2_diet_pe", "PC3_diet_pe")]
+
+# Pheno
+write.table(pheno_bss, 
+	"/PATH/TO/osca_metagenomics_bristol.pheno",
+	col.names = F, row.names = F, sep = "\t", quote = F)
+
+```
