@@ -1,11 +1,11 @@
-README: ASD_microbiome_AAB_QTAB code
-Author: Chloe Yap
-Date: 8 October 2021
+## README: ASD_microbiome_AAB_QTAB code
+## Author: Chloe Yap
+## Date: 8 October 2021
 
-Description:
+## Description:
 This repository contains code used in the AAB and QTAB stool metagenomics analysis.
 
-Contents:
+## Contents:
 metagenomics_analysis_taxonomic_manuscript.Rmd
 	- contains code for most analyses (eg. microbiome diversity, differential abundance, linear models)
 	- N.B. the code contained here is specific to the taxonomic for demonstration purposes.
