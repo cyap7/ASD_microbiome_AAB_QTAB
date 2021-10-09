@@ -5,7 +5,7 @@
 [![DOI](https://zenodo.org/badge/376450308.svg)](https://zenodo.org/badge/latestdoi/376450308)
 
 ## Description:
-This repository contains code used in the AAB and QTAB stool metagenomics analysis.
+This repository contains code used in the AAB and QTAB stool metagenomics analysis, and accompanying the paper titled, **"Autism-gut microbiome connections may reflect autism-related dietary diversity"**.
 
 ## Contents:
 `metagenomics_analysis_taxonomic_manuscript.Rmd`
