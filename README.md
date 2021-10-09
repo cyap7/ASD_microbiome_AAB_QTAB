@@ -1,5 +1,5 @@
 # README: ASD_microbiome_AAB_QTAB code
-#### Author: Chloe Yap
+#### Author: Chloe X Yap
 #### Date: 8 October 2021
 
 [![DOI](https://zenodo.org/badge/376450308.svg)](https://zenodo.org/badge/latestdoi/376450308)
