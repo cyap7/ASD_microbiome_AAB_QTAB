@@ -2,6 +2,8 @@
 #### Author: Chloe Yap
 #### Date: 8 October 2021
 
+[![DOI](https://zenodo.org/badge/376450308.svg)](https://zenodo.org/badge/latestdoi/376450308)
+
 ## Description:
 This repository contains code used in the AAB and QTAB stool metagenomics analysis.
 
