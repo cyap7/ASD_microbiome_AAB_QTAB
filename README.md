@@ -36,3 +36,8 @@ This repository contains code used in the AAB and QTAB stool metagenomics analys
 	* R code used to perform the "direct" analysis
 	* input the "direct" analysis output from `metagenomics_analysis_linktaxafunc_manuscript.R` (eg. "aab_Romboutsia.timonensis_MICROBAgenes.txt")
 	* differential abundance analysis (ANCOMv2.1)
+
+##### Updated: 14 May 2022
+
+Updated `metagenomics_analysis_osca_prep_manuscript.Rmd`
+- to perform the clr-transform, we used the mixOmics::logratio.transfo() function. We inadvertently had used the transpose of the intended matrix. We have re-run the OREML analyses and confirmed that the impact on the presented results are minior, and that the conclusions stand as in the original manuscript. We provide here the updated version of Fig.2 which directly pertains to these results. We sincerely apologise for any inconvenience caused by this error.
