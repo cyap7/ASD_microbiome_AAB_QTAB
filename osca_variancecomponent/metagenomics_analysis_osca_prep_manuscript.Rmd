@@ -447,7 +447,7 @@ ggplot(taxa_count_species_common.long5, aes(x = Read_count, color = Species)) +
 # Perform clr
 taxa_count_species_common_clr <- taxa_count_species_common
 tmp <- as.matrix(taxa_count_species_common_clr[,2:ncol(taxa_count_species_common_clr)])
-taxa_count_species_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+taxa_count_species_common_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(taxa_count_species_common_clr.tmp) <- "matrix"
 
 taxa_count_species_common_clr <- data.frame(Species = taxa_count_species_common$Species, taxa_count_species_common_clr.tmp)
@@ -646,7 +646,7 @@ ggplot(taxa_count_genus_common.long3, aes(x = Read_count, color = Genus)) +
 # Perform clr
 taxa_count_genus_common_clr <- taxa_count_genus_common
 tmp <- as.matrix(taxa_count_genus_common_clr[,2:ncol(taxa_count_genus_common_clr)])
-taxa_count_genus_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+taxa_count_genus_common_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(taxa_count_genus_common_clr.tmp) <- "matrix"
 
 taxa_count_genus_common_clr <- data.frame(Genus = taxa_count_genus_common$Genus, taxa_count_genus_common_clr.tmp)
@@ -824,7 +824,7 @@ ggplot(taxa_count_family_common.long3, aes(x = Read_count, color = Family)) +
 # Perform clr
 taxa_count_family_common_clr <- taxa_count_family_common
 tmp <- as.matrix(taxa_count_family_common_clr[,2:ncol(taxa_count_family_common_clr)])
-taxa_count_family_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+taxa_count_family_common_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(taxa_count_family_common_clr.tmp) <- "matrix"
 
 taxa_count_family_common_clr <- data.frame(Family = taxa_count_family_common$Family, taxa_count_family_common_clr.tmp)
@@ -932,7 +932,7 @@ taxa_count_species_rm0 <- taxa_count_rm0
 # Perform clr
 taxa_count_species_rm0_clr <- taxa_count_species_rm0
 tmp <- as.matrix(taxa_count_species_rm0_clr[,3:ncol(taxa_count_species_rm0_clr)])
-taxa_count_species_rm0_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+taxa_count_species_rm0_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(taxa_count_species_rm0_clr.tmp) <- "matrix"
 
 taxa_count_species_rm0_clr <- data.frame(Species = taxa_count_species_rm0$Taxon, taxa_count_species_rm0_clr.tmp)
@@ -1087,7 +1087,7 @@ taxa_count_species_rm0_rare_01 <- data.frame(Species = taxa_count_species_rm0_ra
 # Perform clr
 taxa_count_species_rm0_rare_clr <- taxa_count_species_rm0_rare
 tmp <- as.matrix(taxa_count_species_rm0_rare_clr[,3:ncol(taxa_count_species_rm0_rare_clr)])
-taxa_count_species_rm0_rare_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+taxa_count_species_rm0_rare_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(taxa_count_species_rm0_rare_clr.tmp) <- "matrix"
 
 taxa_count_species_rm0_rare_clr <- data.frame(Species = taxa_count_species_rm0_rare_clr$Species, taxa_count_species_rm0_rare_clr.tmp)
@@ -1308,7 +1308,7 @@ ggplot(taxa_count_species_common.long5, aes(x = Read_count, color = Species)) +
 # Perform clr
 taxa_count_species_common_clr <- taxa_count_species_common
 tmp <- as.matrix(taxa_count_species_common_clr[,2:ncol(taxa_count_species_common_clr)])
-taxa_count_species_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+taxa_count_species_common_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(taxa_count_species_common_clr.tmp) <- "matrix"
 
 taxa_count_species_common_clr <- data.frame(Species = taxa_count_species_common$Species, taxa_count_species_common_clr.tmp)
@@ -1522,7 +1522,7 @@ ggplot(ec_common.long7, aes(x = Read_count, color = VariableID)) +
 # Perform clr
 ec_common_clr <- ec_common
 tmp <- as.matrix(ec_common_clr[,2:ncol(ec_common_clr)])
-ec_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+ec_common_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(ec_common_clr.tmp) <- "matrix"
 ec_common_clr <- data.frame(VariableID = ec_common$VariableID, ec_common_clr.tmp)
 
@@ -1685,7 +1685,7 @@ ec_rm0_rare_01 <- data.frame(VariableID = ec_rm0_rare$VariableID, ec_rm0_rare_01
 # Perform clr
 ec_rm0_rare_clr <- ec_rm0_rare
 tmp <- as.matrix(ec_rm0_rare_clr[,2:ncol(ec_rm0_rare_clr)])
-ec_rm0_rare_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+ec_rm0_rare_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(ec_rm0_rare_clr.tmp) <- "matrix"
 
 ec_rm0_rare_clr <- data.frame(VariableID = ec_rm0_rare$VariableID, ec_rm0_rare_clr.tmp)
@@ -1887,7 +1887,7 @@ ggplot(ec_common.long5, aes(x = Read_count, color = VariableID)) +
 # Perform clr
 ec_common_clr <- ec_common
 tmp <- as.matrix(ec_common_clr[,2:ncol(ec_common_clr)])
-ec_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+ec_common_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(ec_common_clr.tmp) <- "matrix"
 
 ec_common_clr <- data.frame(VariableID = ec_common_clr$VariableID, ec_common_clr.tmp)
@@ -2065,7 +2065,7 @@ ggplot(tcdb_common.long5, aes(x = Read_count, color = VariableID)) +
 # Perform clr
 tcdb_common_clr <- tcdb_common
 tmp <- as.matrix(tcdb_common_clr[,2:ncol(tcdb_common_clr)])
-tcdb_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+tcdb_common_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(tcdb_common_clr.tmp) <- "matrix"
 
 tcdb_common_clr <- data.frame(VariableID = tcdb_common_clr$VariableID, tcdb_common_clr.tmp)
@@ -2243,7 +2243,7 @@ ggplot(mcpath_common.long5, aes(x = Read_count, color = VariableID)) +
 # Perform clr
 mcpath_common_clr <- mcpath_common
 tmp <- as.matrix(mcpath_common_clr[,2:ncol(mcpath_common_clr)])
-mcpath_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+mcpath_common_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(mcpath_common_clr.tmp) <- "matrix"
 
 mcpath_common_clr <- data.frame(VariableID = mcpath_common_clr$VariableID, mcpath_common_clr.tmp)
@@ -2427,7 +2427,7 @@ ggplot(func_common.long5, aes(x = Read_count, color = VariableID)) +
 # Perform clr
 func_common_clr <- func_common
 tmp <- as.matrix(func_common_clr[,2:ncol(func_common_clr)])
-func_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+func_common_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(func_common_clr.tmp) <- "matrix"
 
 func_common_clr <- data.frame(VariableID = func_common_clr$VariableID, func_common_clr.tmp)
@@ -2568,7 +2568,7 @@ func_rm0_rare_01 <- data.frame(VariableID = func_rm0_rare$VariableID, func_rm0_r
 # Perform clr
 func_rm0_rare_clr <- func_rm0_rare
 tmp <- as.matrix(func_rm0_rare_clr[,2:ncol(func_rm0_rare_clr)])
-func_rm0_rare_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+func_rm0_rare_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(func_rm0_rare_clr.tmp) <- "matrix"
 
 func_rm0_rare_clr <- data.frame(VariableID = func_rm0_rare_clr$VariableID, func_rm0_rare_clr.tmp)
@@ -2739,7 +2739,7 @@ ggplot(func_common.long5, aes(x = Read_count, color = VariableID)) +
 # Perform clr
 func_common_clr <- func_common
 tmp <- as.matrix(func_common_clr[,2:ncol(func_common_clr)])
-func_common_clr.tmp <- as.matrix(logratio.transfo(tmp, logratio = "CLR", offset = 0.001))
+func_common_clr.tmp <- as.matrix(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(func_common_clr.tmp) <- "matrix"
 
 func_common_clr <- data.frame(VariableID = func_common_clr$VariableID, func_common_clr.tmp)
