@@ -342,7 +342,10 @@ print(paste("Number of MIC (Microba-specific) species:", mic_n, sep = " "))
 # Perform clr
 taxa_clr <- taxa
 #taxa_clr.tmp <- data.frame(clr(as.matrix(taxa_clr[,3:ncol(taxa_clr)])))
-taxa_clr.tmp <- data.frame(logratio.transfo(as.matrix(taxa_clr[,3:ncol(taxa_clr)], logratio = "CLR", offset = 0.001)))
+tmp <- as.matrix(taxa_clr[,3:ncol(taxa_clr)])
+rownames(tmp) <- taxa_clr$Taxon
+taxa_clr.tmp <- t(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
+class(taxa_clr.tmp) <- "matrix"
 taxa_clr <- data.frame(Taxon = taxa$Taxon, GTDB.taxonomy = taxa$GTDB.taxonomy, taxa_clr.tmp)
 
 # Remove low-abundance taxa
@@ -361,16 +364,20 @@ if (length(zero_reads_rm) >= 1) {
 taxa_count_clr <- taxa_count
 #taxa_count_clr.tmp <- data.frame(clr(as.matrix(taxa_count_clr[,3:ncol(taxa_count_clr)])))
 tmp <- as.matrix(taxa_count_clr[,3:ncol(taxa_count_clr)])
-taxa_count_clr.tmp <- logratio.transfo(tmp, logratio = "CLR", offset = 0.001)
+rownames(tmp) <- taxa_count_clr$Taxon
+taxa_count_clr.tmp <- t(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
 class(taxa_count_clr.tmp) <- "matrix"
 taxa_count_clr <- data.frame(Taxon = taxa_count$Taxon, GTDB.taxonomy = taxa_count$GTDB.taxonomy, taxa_count_clr.tmp)
 
 # Remove low-abundance taxa
-taxa_count_rm0_clr <- taxa_count_clr[-which(taxa_count_clr$Taxon %in% zero_rm_taxa),]
-taxa_count_rm0_clr$Taxon <- as.character(taxa_count_rm0_clr$Taxon)
-if (length(zero_reads_rm) >= 1) {
-  taxa_count_rm0_clr <- taxa_count_rm0_clr[-which(taxa_count_rm0_clr$Taxon %in% zero_reads_rm),]
-}
+taxa_count_rm0 <- taxa_count[-which(taxa_count$Taxon %in% zero_rm_taxa),]
+taxa_count_rm0_clr <- taxa_count_rm0
+
+tmp <- as.matrix(taxa_count_rm0_clr[,3:ncol(taxa_count_rm0_clr)])
+rownames(tmp) <- taxa_count_rm0_clr$Taxon
+taxa_count_rm0_clr.tmp <- t(logratio.transfo(t(tmp), logratio = "CLR", offset = 0.001))
+class(taxa_count_rm0_clr.tmp) <- "matrix"
+taxa_count_rm0_clr <- data.frame(Taxon = taxa_count_rm0$Taxon, GTDB.taxonomy = taxa_count_rm0$GTDB.taxonomy, taxa_count_rm0_clr.tmp)
 
 ```
 
