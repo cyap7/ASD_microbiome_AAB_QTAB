@@ -2246,11 +2246,11 @@ diversity_diet_taxa_sensitivity
 
 diversity_asd.df <- diversity.df %>% filter(participant_type %in% c("ASD"))
 summary(lm(shannon_food ~ shannon, data = diversity_asd.df))
-summary(lm(shannon_food ~ shannon + age + proforma_sex + diet_pePC1 + diet_pePC2 + diet_pePC3 + as.numeric(bristol_stool_chart_regroup), data = diversity_asd.df))
+summary(lm(shannon_food ~ shannon + age + proforma_sex + diet_PC1 + diet_PC2 + diet_PC3 + as.numeric(bristol_stool_chart_regroup), data = diversity_asd.df))
 
 diversity_non.df <- diversity.df %>% filter(participant_type %in% c("SIB", "UNR"))
 summary(lm(shannon_food ~ shannon, data = diversity_non.df))
-summary(lm(shannon_food ~ shannon + age + proforma_sex + diet_pePC1 + diet_pePC2 + diet_pePC3 + as.numeric(bristol_stool_chart_regroup), data = diversity_non.df))
+summary(lm(shannon_food ~ shannon + age + proforma_sex + diet_PC1 + diet_PC2 + diet_PC3 + as.numeric(bristol_stool_chart_regroup), data = diversity_non.df))
 
 ```
 
@@ -2420,7 +2420,7 @@ ggstatsplot::combine_plots(
   ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)),
   # SSP
   ggstatsplot::ggcoefstats(shannon_food_ssp.lm,
-  title = "Taxa ~ Sensory score", stats.label.color = cols_ssp,
+  title = "Diet ~ Sensory score", stats.label.color = cols_ssp,
   ylab = NULL, stats.label.args = c(nudge_y = 0.3), exclude.intercept = TRUE) + theme(text = element_text(size = 15)),
   # # X-trait PGS
   # ggstatsplot::ggcoefstats(shannon_food_pgs_xtrait.lm,
